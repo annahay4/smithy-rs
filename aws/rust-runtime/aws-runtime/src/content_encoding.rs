@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes};
+use bytes_utils::SegmentedBuf;
 use pin_project_lite::pin_project;
 
 use std::pin::Pin;
@@ -58,6 +59,75 @@ impl AwsChunkedBodyOptions {
     }
 }
 
+#[derive(Debug)]
+enum ChunkBuf {
+    /// Nothing has been buffered yet.
+    Empty,
+    /// Some data has been buffered.
+    /// The SegmentedBuf will automatically purge when it reads off the end of a chunk boundary.
+    Partial(SegmentedBuf<Bytes>),
+    /// The end of the stream has been reached, but there may still be some buffered data.
+    EosPartial(SegmentedBuf<Bytes>),
+    /// An exception terminated this stream.
+    Terminated,
+}
+
+impl ChunkBuf {
+    /// Returns true if there's more buffered data.
+    fn has_data(&self) -> bool {
+        match self {
+            ChunkBuf::Empty | ChunkBuf::Terminated => false,
+            ChunkBuf::Partial(segments) | ChunkBuf::EosPartial(segments) => {
+                segments.remaining() > 0
+            }
+        }
+    }
+
+    /// Returns true if the stream has ended.
+    fn is_eos(&self) -> bool {
+        matches!(self, ChunkBuf::EosPartial(_) | ChunkBuf::Terminated)
+    }
+
+    /// Returns a mutable reference to the underlying buffered data.
+    fn buffered(&mut self) -> &mut SegmentedBuf<Bytes> {
+        match self {
+            ChunkBuf::Empty => panic!("buffer must be populated before reading; this is a bug"),
+            ChunkBuf::Partial(segmented) => segmented,
+            ChunkBuf::EosPartial(segmented) => segmented,
+            ChunkBuf::Terminated => panic!("buffer has been terminated; this is a bug"),
+        }
+    }
+
+    /// Returns a new `ChunkBuf` with additional data buffered. This will only allocate
+    /// if the `ChunkBuf` was previously empty.
+    fn with_partial(self, partial: Bytes) -> Self {
+        match self {
+            ChunkBuf::Empty => {
+                let mut segmented = SegmentedBuf::new();
+                segmented.push(partial);
+                ChunkBuf::Partial(segmented)
+            }
+            ChunkBuf::Partial(mut segmented) => {
+                segmented.push(partial);
+                ChunkBuf::Partial(segmented)
+            }
+            ChunkBuf::EosPartial(_) | ChunkBuf::Terminated => {
+                panic!("cannot buffer more data after the stream has ended or been terminated; this is a bug")
+            }
+        }
+    }
+
+    /// Returns a `ChunkBuf` that has reached end of stream.
+    fn ended(self) -> Self {
+        match self {
+            ChunkBuf::Empty => ChunkBuf::EosPartial(SegmentedBuf::new()),
+            ChunkBuf::Partial(segmented) => ChunkBuf::EosPartial(segmented),
+            ChunkBuf::EosPartial(_) => panic!("already end of stream; this is a bug"),
+            ChunkBuf::Terminated => panic!("stream terminated; this is a bug"),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum AwsChunkedBodyState {
     /// Write out the size of the chunk that will follow. Then, transition into the
@@ -103,6 +173,8 @@ pin_project! {
         state: AwsChunkedBodyState,
         options: AwsChunkedBodyOptions,
         inner_body_bytes_read_so_far: usize,
+        #[pin]
+        chunk_buffer: ChunkBuf,
     }
 }
 
@@ -114,6 +186,36 @@ impl<Inner> AwsChunkedBody<Inner> {
             state: AwsChunkedBodyState::WritingChunkSize,
             options,
             inner_body_bytes_read_so_far: 0,
+            chunk_buffer: ChunkBuf::Empty,
+        }
+    }
+
+    fn buffer_next_chunk(
+        inner: Pin<&mut Inner>,
+        mut chunk_buffer: Pin<&mut ChunkBuf>,
+        cx: &mut Context<'_>,
+    ) -> Poll<bool>
+    where
+        Inner: http_body_1x::Body<Data = Bytes, Error = aws_smithy_types::body::Error>,
+    {
+        match inner.poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.into_data().ok() {
+                    match chunk_buffer.as_mut().get_mut() {
+                        ChunkBuf::Empty => {
+                            let mut buf = SegmentedBuf::new();
+                            buf.push(data);
+                            *chunk_buffer.as_mut().get_mut() = ChunkBuf::Partial(buf);
+                        }
+                        ChunkBuf::Partial(buf) => buf.push(data),
+                        _ => {}
+                    }
+                }
+                Poll::Ready(true) // continue
+            }
+            Poll::Ready(None) => Poll::Ready(false), // break
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Err(_))) => Poll::Ready(false), // break
         }
     }
 
@@ -334,156 +436,19 @@ where
         tracing::trace!(state = ?self.state, "polling AwsChunkedBody");
         let mut this = self.project();
 
-        // Both `WritingChunkSize` and `Closed` states short circuit without polling the inner body
+        while !this.chunk_buffer.is_eos() {
+            if this.chunk_buffer.has_data() {}
 
-        // Initial setup, we do not poll the inner body here
-        if *this.state == AwsChunkedBodyState::WritingChunkSize {
-            if this.options.stream_length == 0 {
-                // If the stream is empty, we skip to writing trailers after writing the CHUNK_TERMINATOR.
-                tracing::trace!("stream is empty, writing chunk terminator");
-                let frame = http_body_1x::Frame::data(Bytes::from(CHUNK_TERMINATOR));
-                *this.state = AwsChunkedBodyState::WritingTrailers;
-                return Poll::Ready(Some(Ok(frame)));
-            } else {
-                // A chunk must be prefixed by chunk size in hexadecimal
-                let chunk_size = format!(
-                    "{:X?}{}",
-                    this.options.stream_length,
-                    std::str::from_utf8(CRLF_RAW).unwrap()
-                );
-                tracing::trace!(%chunk_size, "writing chunk size");
-                let chunk_size = http_body_1x::Frame::data(Bytes::from(chunk_size));
-                *this.state = AwsChunkedBodyState::WritingChunk;
-                return Poll::Ready(Some(Ok(chunk_size)));
+            match Self::buffer_next_chunk(this.inner.as_mut(), this.chunk_buffer.as_mut(), cx) {
+                Poll::Ready(true) => continue,
+                Poll::Ready(false) => break,
+                Poll::Pending => return Poll::Pending,
             }
         }
 
-        // Polled after completion
-        if *this.state == AwsChunkedBodyState::Closed {
-            return Poll::Ready(None);
-        }
+        // handle trailers
 
-        // For all other states we must poll the inner body
-        let maybe_frame = this.inner.poll_frame(cx);
-        tracing::trace!(poll_state = ?maybe_frame, "Polling InnerBody");
-
-        match maybe_frame {
-            Poll::Ready(Some(Ok(frame))) => match *this.state {
-                // Both data chunks and trailers are written as Frame::data so we treat these states similarly
-                // Importantly we cannot know that the body data of the InnerBody is exhausted until we see a
-                // trailer frame or a Poll::Ready(None)
-                AwsChunkedBodyState::WritingChunk => {
-                    if frame.is_data() {
-                        let data = frame.data_ref().expect("Data frame has data");
-                        tracing::trace!(len = data.len(), "Writing chunk data");
-                        *this.inner_body_bytes_read_so_far += data.len();
-                        Poll::Ready(Some(Ok(frame)))
-                    } else {
-                        tracing::trace!(
-                            "No more chunk data, writing CRLF + CHUNK_TERMINATOR to end the data, and the first trailer frame"
-                        );
-
-                        // We exhausted the body data, now check if the length is correct
-                        if let Err(poll_stream_len_err) =
-                            http_1x_utils::check_for_stream_length_mismatch(
-                                *this.inner_body_bytes_read_so_far as u64,
-                                this.options.stream_length,
-                            )
-                        {
-                            return poll_stream_len_err;
-                        }
-
-                        *this.state = AwsChunkedBodyState::WritingTrailers;
-                        let trailers = frame.trailers_ref();
-
-                        // NOTE: there is a subtle logic bug here (which is present in the http-02x implementation as well)
-                        // The check for this error assumes that all trailers will come in a single trailer frame. Currently
-                        // I believe this will always be the case since the only thing we send trailers for in AwsChunked is
-                        // streaming checksums and that is a single trailer value. But it might not always be true. We should
-                        // fix this bug when we update the behavior here to match the actual spec.
-                        // The fix probably looks like returning Poll::Pending while we buffer all of the trailers and then
-                        // comparing the actual length to the expected length before returning a final frame containing all
-                        // of the trailers.
-                        let actual_length: u64 =
-                            http_1x_utils::total_rendered_length_of_trailers(trailers);
-                        let expected_length = this.options.total_trailer_length();
-                        if expected_length != actual_length {
-                            let err =
-                                Box::new(AwsChunkedBodyError::ReportedTrailerLengthMismatch {
-                                    actual: actual_length,
-                                    expected: expected_length,
-                                });
-                            return Poll::Ready(Some(Err(err)));
-                        }
-
-                        // Capacity = actual_length (in case all of the trailers specified in  come in AwsChunkedBodyOptions
-                        // come in the first trailer frame which is going to be the case most of the time in practice) + 7
-                        // (2 + 3) for the initial CRLF + CHUNK_TERMINATOR to end the chunked data + 2 for the final CRLF
-                        // ending the trailers section.
-                        let mut buf = BytesMut::with_capacity(actual_length as usize + 7);
-                        // End the final data chunk
-                        buf.extend_from_slice(&[CRLF_RAW, CHUNK_TERMINATOR_RAW].concat());
-
-                        // We transform the trailers into raw bytes. We can't write them with Frame::trailers
-                        // since we must include the CRLF + CHUNK_TERMINATOR that end the body and the CRLFs
-                        // after each trailer, so we write them as Frame::data
-                        let trailers = http_1x_utils::trailers_as_aws_chunked_bytes(trailers, buf);
-                        Poll::Ready(Some(Ok(http_body_1x::Frame::data(trailers.into()))))
-                    }
-                }
-                AwsChunkedBodyState::WritingTrailers => {
-                    let trailers = frame.trailers_ref();
-                    let actual_length: u64 =
-                        http_1x_utils::total_rendered_length_of_trailers(trailers);
-                    let buf = BytesMut::with_capacity(actual_length as usize + 7);
-                    let trailers = http_1x_utils::trailers_as_aws_chunked_bytes(trailers, buf);
-                    Poll::Ready(Some(Ok(http_body_1x::Frame::data(trailers.into()))))
-                }
-                AwsChunkedBodyState::Closed | AwsChunkedBodyState::WritingChunkSize => {
-                    unreachable!("{}", UNREACHABLE_STATES)
-                }
-            },
-            // InnerBody data exhausted, add finalizing bytes depending on current state
-            Poll::Ready(None) => {
-                let trailers = match *this.state {
-                    AwsChunkedBodyState::WritingChunk => {
-                        // We exhausted the body data, now check if the length is correct
-                        if let Err(poll_stream_len_err) =
-                            http_1x_utils::check_for_stream_length_mismatch(
-                                *this.inner_body_bytes_read_so_far as u64,
-                                this.options.stream_length,
-                            )
-                        {
-                            return poll_stream_len_err;
-                        }
-
-                        // Since we exhausted the body data, but are still in the WritingChunk state we did
-                        // not poll any trailer frames and we write the CRLF + Chunk terminator to begin the
-                        // trailer section plus a single final CRLF to end the (empty) trailer section
-                        let mut trailers = BytesMut::with_capacity(7);
-                        trailers.extend_from_slice(
-                            &[CRLF_RAW, CHUNK_TERMINATOR_RAW, CRLF_RAW].concat(),
-                        );
-                        trailers
-                    }
-                    AwsChunkedBodyState::WritingTrailers => {
-                        let mut trailers = BytesMut::with_capacity(2);
-                        trailers.extend_from_slice(CRLF_RAW);
-                        trailers
-                    }
-                    AwsChunkedBodyState::Closed | AwsChunkedBodyState::WritingChunkSize => {
-                        unreachable!("{}", UNREACHABLE_STATES)
-                    }
-                };
-
-                let frame = http_body_1x::Frame::data(trailers.into());
-                *this.state = AwsChunkedBodyState::Closed;
-                Poll::Ready(Some(Ok(frame)))
-            }
-            // Passthrough states
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-        }
+        todo!()
     }
 }
 /// Utility functions to help with the [http_body_1x::Body] trait implementation
