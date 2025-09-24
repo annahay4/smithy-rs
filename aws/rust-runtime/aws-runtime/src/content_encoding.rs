@@ -7,6 +7,7 @@ use bytes::{Buf, Bytes};
 use bytes_utils::SegmentedBuf;
 use pin_project_lite::pin_project;
 
+use std::io::Read;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -17,6 +18,8 @@ const CHUNK_TERMINATOR: &str = "0\r\n";
 const CHUNK_TERMINATOR_RAW: &[u8] = b"0\r\n";
 
 const TRAILER_SEPARATOR: &[u8] = b":";
+
+const DEFAULT_CHUNK_SIZE_BYTE: usize = 64 * 1024; // 64 KB
 
 /// Content encoding header value constants
 pub mod header_value {
@@ -74,12 +77,10 @@ enum ChunkBuf {
 
 impl ChunkBuf {
     /// Returns true if there's more buffered data.
-    fn has_data(&self) -> bool {
+    fn remaining(&self) -> usize {
         match self {
-            ChunkBuf::Empty | ChunkBuf::Terminated => false,
-            ChunkBuf::Partial(segments) | ChunkBuf::EosPartial(segments) => {
-                segments.remaining() > 0
-            }
+            ChunkBuf::Empty | ChunkBuf::Terminated => 0,
+            ChunkBuf::Partial(segments) | ChunkBuf::EosPartial(segments) => segments.remaining(),
         }
     }
 
@@ -175,6 +176,8 @@ pin_project! {
         inner_body_bytes_read_so_far: usize,
         #[pin]
         chunk_buffer: ChunkBuf,
+        #[pin]
+        buffered_trailer: Option<http_1x::HeaderMap>,
     }
 }
 
@@ -187,12 +190,14 @@ impl<Inner> AwsChunkedBody<Inner> {
             options,
             inner_body_bytes_read_so_far: 0,
             chunk_buffer: ChunkBuf::Empty,
+            buffered_trailer: None,
         }
     }
 
     fn buffer_next_chunk(
         inner: Pin<&mut Inner>,
         mut chunk_buffer: Pin<&mut ChunkBuf>,
+        mut buffered_trailer: Pin<&mut Option<http_1x::HeaderMap>>,
         cx: &mut Context<'_>,
     ) -> Poll<bool>
     where
@@ -200,7 +205,8 @@ impl<Inner> AwsChunkedBody<Inner> {
     {
         match inner.poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.into_data().ok() {
+                if frame.is_data() {
+                    let data = frame.into_data().unwrap();
                     match chunk_buffer.as_mut().get_mut() {
                         ChunkBuf::Empty => {
                             let mut buf = SegmentedBuf::new();
@@ -210,6 +216,10 @@ impl<Inner> AwsChunkedBody<Inner> {
                         ChunkBuf::Partial(buf) => buf.push(data),
                         _ => {}
                     }
+                } else {
+                    let buf = chunk_buffer.as_mut().get_mut();
+                    *buf = std::mem::replace(buf, ChunkBuf::Empty).ended();
+                    *buffered_trailer.as_mut().get_mut() = frame.into_trailers().ok();
                 }
                 Poll::Ready(true) // continue
             }
@@ -436,19 +446,59 @@ where
         tracing::trace!(state = ?self.state, "polling AwsChunkedBody");
         let mut this = self.project();
 
-        while !this.chunk_buffer.is_eos() {
-            if this.chunk_buffer.has_data() {}
+        use AwsChunkedBodyState::*;
+        match *this.state {
+            WritingChunkSize | WritingChunk => {
+                while !this.chunk_buffer.is_eos() {
+                    if this.chunk_buffer.remaining() >= DEFAULT_CHUNK_SIZE_BYTE {
+                        let buf = this.chunk_buffer.buffered();
+                        let chunk_bytes = buf.copy_to_bytes(DEFAULT_CHUNK_SIZE_BYTE);
+                        let chunk_size = format!("{:X}", DEFAULT_CHUNK_SIZE_BYTE);
+                        let mut chunk = bytes::BytesMut::new();
+                        chunk.extend_from_slice(chunk_size.as_bytes());
+                        chunk.extend_from_slice(CRLF_RAW);
+                        chunk.extend_from_slice(&chunk_bytes);
+                        chunk.extend_from_slice(CRLF_RAW);
+                        let chunk = chunk.freeze();
+                        return Poll::Ready(Some(Ok(http_body_1x::Frame::data(chunk))));
+                    }
 
-            match Self::buffer_next_chunk(this.inner.as_mut(), this.chunk_buffer.as_mut(), cx) {
-                Poll::Ready(true) => continue,
-                Poll::Ready(false) => break,
-                Poll::Pending => return Poll::Pending,
+                    match Self::buffer_next_chunk(
+                        this.inner.as_mut(),
+                        this.chunk_buffer.as_mut(),
+                        this.buffered_trailer.as_mut(),
+                        cx,
+                    ) {
+                        Poll::Ready(true) => continue,
+                        Poll::Ready(false) => break,
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+
+                if this.chunk_buffer.remaining() > 0 {
+                    let bytes_len_to_read =
+                        std::cmp::min(this.chunk_buffer.remaining(), DEFAULT_CHUNK_SIZE_BYTE);
+                    let buf = this.chunk_buffer.buffered();
+                    let chunk_bytes = buf.copy_to_bytes(bytes_len_to_read);
+                    let chunk_size = format!("{:X}", chunk_bytes.len());
+                    let mut chunk = bytes::BytesMut::new();
+                    chunk.extend_from_slice(chunk_size.as_bytes());
+                    chunk.extend_from_slice(CRLF_RAW);
+                    chunk.extend_from_slice(&chunk_bytes);
+                    chunk.extend_from_slice(CRLF_RAW);
+                    let chunk = chunk.freeze();
+
+                    return Poll::Ready(Some(Ok(http_body_1x::Frame::data(chunk))));
+                }
+
+                *this.state = AwsChunkedBodyState::WritingTrailers;
+                return Poll::Ready(None);
             }
+            WritingTrailers => {
+                todo!()
+            }
+            Closed => Poll::Ready(None),
         }
-
-        // handle trailers
-
-        todo!()
     }
 }
 /// Utility functions to help with the [http_body_1x::Body] trait implementation
