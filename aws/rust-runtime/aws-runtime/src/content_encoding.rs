@@ -38,6 +38,8 @@ pub struct AwsChunkedBodyOptions {
     /// The length of each trailer sent within an `AwsChunkedBody`. Necessary in
     /// order to correctly calculate the total size of the body accurately.
     trailer_lengths: Vec<u64>,
+    /// The size of each chunk in bytes. Defaults to DEFAULT_CHUNK_SIZE_BYTE if not set.
+    chunk_size: Option<usize>,
 }
 
 impl AwsChunkedBodyOptions {
@@ -46,7 +48,19 @@ impl AwsChunkedBodyOptions {
         Self {
             stream_length,
             trailer_lengths,
+            chunk_size: None,
         }
+    }
+
+    /// Set the chunk size for the body.
+    fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = Some(chunk_size);
+        self
+    }
+
+    /// Get the chunk size, defaulting to DEFAULT_CHUNK_SIZE_BYTE if not set.
+    fn chunk_size(&self) -> usize {
+        self.chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE_BYTE)
     }
 
     fn total_trailer_length(&self) -> u64 {
@@ -431,8 +445,6 @@ mod http_02x_utils {
     }
 }
 
-const UNREACHABLE_STATES: &str = "These states already short circuited";
-
 /// Implementing the [http_body_1x::Body] trait
 impl<Inner> http_body_1x::Body for AwsChunkedBody<Inner>
 where
@@ -455,14 +467,15 @@ where
     ) -> Poll<Option<Result<http_body_1x::Frame<Self::Data>, Self::Error>>> {
         tracing::trace!(state = ?self.state, "polling AwsChunkedBody");
         let mut this = self.project();
+        let chunk_size = this.options.chunk_size();
 
         use AwsChunkedBodyState::*;
         match *this.state {
             WritingChunkSize | WritingChunk => {
                 while !this.chunk_buffer.is_eos() {
-                    if this.chunk_buffer.remaining() >= DEFAULT_CHUNK_SIZE_BYTE {
+                    if this.chunk_buffer.remaining() >= chunk_size {
                         let buf = this.chunk_buffer.buffered();
-                        let chunk_bytes = buf.copy_to_bytes(DEFAULT_CHUNK_SIZE_BYTE);
+                        let chunk_bytes = buf.copy_to_bytes(chunk_size);
                         let chunk = Self::unsigned_chunk(chunk_bytes);
                         return Poll::Ready(Some(Ok(http_body_1x::Frame::data(chunk))));
                     }
@@ -481,7 +494,7 @@ where
 
                 if this.chunk_buffer.remaining() > 0 {
                     let bytes_len_to_read =
-                        std::cmp::min(this.chunk_buffer.remaining(), DEFAULT_CHUNK_SIZE_BYTE);
+                        std::cmp::min(this.chunk_buffer.remaining(), chunk_size);
                     let buf = this.chunk_buffer.buffered();
                     let chunk_bytes = buf.copy_to_bytes(bytes_len_to_read);
                     let chunk = Self::unsigned_chunk(chunk_bytes);
@@ -1168,6 +1181,108 @@ mod tests {
             let expected_length = (trailers_as_aws_chunked_bytes(trailers, buf).len()) as u64;
 
             assert_eq!(expected_length, actual_length);
+        }
+
+        #[tokio::test]
+        async fn test_poll_frame_with_default_chunk_size() {
+            let test_data = Bytes::from("1234567890123456789012345");
+            let body = SdkBody::from(test_data.clone());
+            let options = AwsChunkedBodyOptions::new(test_data.len() as u64, vec![]);
+            let mut chunked_body = AwsChunkedBody::new(body, options);
+
+            let mut data_frames = Vec::new();
+            while let Some(frame) = chunked_body.frame().await.transpose().unwrap() {
+                if let Ok(data) = frame.into_data() {
+                    data_frames.push(data);
+                }
+            }
+
+            assert_eq!(data_frames.len(), 2); // Data fits in one chunk, plus the final chunk
+            assert_eq!(
+                Bytes::from_static(b"19\r\n1234567890123456789012345\r\n"),
+                data_frames[0]
+            );
+            assert_eq!(Bytes::from_static(b"0\r\n\r\n"), data_frames[1]);
+        }
+
+        #[tokio::test]
+        async fn test_poll_frame_with_custom_chunk_size() {
+            let test_data = Bytes::from("1234567890123456789012345");
+            let body = SdkBody::from(test_data.clone());
+            let options =
+                AwsChunkedBodyOptions::new(test_data.len() as u64, vec![]).with_chunk_size(10);
+            let mut chunked_body = AwsChunkedBody::new(body, options);
+
+            let mut data_frames = Vec::new();
+            while let Some(frame) = chunked_body.frame().await.transpose().unwrap() {
+                if let Ok(data) = frame.into_data() {
+                    data_frames.push(data);
+                }
+            }
+
+            assert_eq!(4, data_frames.len()); // 25 bytes / 10 = 2.5 so 3 chunks, plus the final chunk
+            assert_eq!(Bytes::from_static(b"A\r\n1234567890\r\n"), data_frames[0]);
+            assert_eq!(Bytes::from_static(b"A\r\n1234567890\r\n"), data_frames[1]);
+            assert_eq!(Bytes::from_static(b"5\r\n12345\r\n"), data_frames[2]);
+            assert_eq!(Bytes::from_static(b"0\r\n\r\n"), data_frames[3]);
+        }
+
+        #[tokio::test]
+        async fn test_poll_frame_with_trailers() {
+            // A body that returns one data frame and one trailers frame
+            pin_project! {
+                struct TestBody {
+                    data: Option<Bytes>,
+                    trailers: Option<HeaderMap>,
+                }
+            }
+
+            impl Body for TestBody {
+                type Data = Bytes;
+                type Error = aws_smithy_types::body::Error;
+
+                fn poll_frame(
+                    self: Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                    let this = self.project();
+
+                    if let Some(data) = this.data.take() {
+                        return Poll::Ready(Some(Ok(Frame::data(data))));
+                    }
+
+                    if let Some(trailers) = this.trailers.take() {
+                        return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                    }
+
+                    Poll::Ready(None)
+                }
+            }
+
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-amz-checksum-crc32", HeaderValue::from_static("78DeVw=="));
+            let body = TestBody {
+                data: Some(Bytes::from("1234567890123456789012345")),
+                trailers: Some(trailers),
+            };
+            let options = AwsChunkedBodyOptions::new(4, vec![]).with_chunk_size(10);
+            let mut chunked_body = AwsChunkedBody::new(body, options);
+
+            let mut data_frames = Vec::new();
+            while let Some(frame) = chunked_body.frame().await.transpose().unwrap() {
+                if let Ok(data) = frame.into_data() {
+                    data_frames.push(data);
+                }
+            }
+
+            assert_eq!(4, data_frames.len()); // 25 bytes / 10 = 2.5 so 3 chunks, plus the final chunk
+            assert_eq!(Bytes::from_static(b"A\r\n1234567890\r\n"), data_frames[0]);
+            assert_eq!(Bytes::from_static(b"A\r\n1234567890\r\n"), data_frames[1]);
+            assert_eq!(Bytes::from_static(b"5\r\n12345\r\n"), data_frames[2]);
+            assert_eq!(
+                Bytes::from_static(b"0\r\nx-amz-checksum-crc32:78DeVw==\r\n\r\n"),
+                data_frames[3]
+            );
         }
     }
 }
