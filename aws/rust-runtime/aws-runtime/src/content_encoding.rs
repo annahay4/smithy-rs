@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use bytes_utils::SegmentedBuf;
 use pin_project_lite::pin_project;
 
@@ -227,6 +227,16 @@ impl<Inner> AwsChunkedBody<Inner> {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Err(_))) => Poll::Ready(false), // break
         }
+    }
+
+    fn unsigned_chunk(chunk_bytes: Bytes) -> Bytes {
+        let chunk_size = format!("{:X}", chunk_bytes.len());
+        let mut chunk = bytes::BytesMut::new();
+        chunk.extend_from_slice(chunk_size.as_bytes());
+        chunk.extend_from_slice(CRLF_RAW);
+        chunk.extend_from_slice(&chunk_bytes);
+        chunk.extend_from_slice(CRLF_RAW);
+        chunk.freeze()
     }
 
     fn encoded_length(&self) -> u64 {
@@ -453,13 +463,7 @@ where
                     if this.chunk_buffer.remaining() >= DEFAULT_CHUNK_SIZE_BYTE {
                         let buf = this.chunk_buffer.buffered();
                         let chunk_bytes = buf.copy_to_bytes(DEFAULT_CHUNK_SIZE_BYTE);
-                        let chunk_size = format!("{:X}", DEFAULT_CHUNK_SIZE_BYTE);
-                        let mut chunk = bytes::BytesMut::new();
-                        chunk.extend_from_slice(chunk_size.as_bytes());
-                        chunk.extend_from_slice(CRLF_RAW);
-                        chunk.extend_from_slice(&chunk_bytes);
-                        chunk.extend_from_slice(CRLF_RAW);
-                        let chunk = chunk.freeze();
+                        let chunk = Self::unsigned_chunk(chunk_bytes);
                         return Poll::Ready(Some(Ok(http_body_1x::Frame::data(chunk))));
                     }
 
@@ -480,24 +484,51 @@ where
                         std::cmp::min(this.chunk_buffer.remaining(), DEFAULT_CHUNK_SIZE_BYTE);
                     let buf = this.chunk_buffer.buffered();
                     let chunk_bytes = buf.copy_to_bytes(bytes_len_to_read);
-                    let chunk_size = format!("{:X}", chunk_bytes.len());
-                    let mut chunk = bytes::BytesMut::new();
-                    chunk.extend_from_slice(chunk_size.as_bytes());
-                    chunk.extend_from_slice(CRLF_RAW);
-                    chunk.extend_from_slice(&chunk_bytes);
-                    chunk.extend_from_slice(CRLF_RAW);
-                    let chunk = chunk.freeze();
+                    let chunk = Self::unsigned_chunk(chunk_bytes);
 
                     return Poll::Ready(Some(Ok(http_body_1x::Frame::data(chunk))));
                 }
 
-                *this.state = AwsChunkedBodyState::WritingTrailers;
-                return Poll::Ready(None);
+                debug_assert!(this.chunk_buffer.remaining() == 0);
+
+                *this.state = WritingTrailers;
+                cx.waker().wake_by_ref();
+                Poll::Pending
             }
             WritingTrailers => {
-                todo!()
+                let mut final_chunk = BytesMut::new();
+                final_chunk.extend_from_slice(CHUNK_TERMINATOR_RAW);
+                if let Some(trailer) = this.buffered_trailer.take() {
+                    final_chunk =
+                        http_1x_utils::trailers_as_aws_chunked_bytes(Some(&trailer), final_chunk)
+                }
+
+                loop {
+                    match this.inner.as_mut().poll_frame(cx) {
+                        Poll::Ready(Some(Ok(frame))) => {
+                            let trailers = frame.into_trailers().ok();
+                            final_chunk = http_1x_utils::trailers_as_aws_chunked_bytes(
+                                trailers.as_ref(),
+                                final_chunk,
+                            );
+                            continue;
+                        }
+                        Poll::Ready(Some(Err(err))) => {
+                            tracing::error!(error = ?err, "error polling inner");
+                            return Poll::Ready(Some(Err(err)));
+                        }
+                        Poll::Ready(None) => {
+                            break;
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+
+                *this.state = Closed;
+                final_chunk.extend_from_slice(CRLF_RAW);
+                return Poll::Ready(Some(Ok(http_body_1x::Frame::data(final_chunk.freeze()))));
             }
-            Closed => Poll::Ready(None),
+            Closed => return Poll::Ready(None),
         }
     }
 }
