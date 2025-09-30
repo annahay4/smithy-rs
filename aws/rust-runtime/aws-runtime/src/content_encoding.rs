@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use aws_sigv4::http_request::SigningError;
+use aws_smithy_runtime_api::client::auth::Sign;
 use aws_smithy_runtime_api::http::Headers;
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
 use bytes::{Buf, Bytes, BytesMut};
@@ -15,6 +17,8 @@ use std::task::{Context, Poll};
 
 const CRLF: &str = "\r\n";
 const CRLF_RAW: &[u8] = b"\r\n";
+
+const CHUNK_SIGNATURE_BEGIN_RAW: &[u8] = b";chunk-signature=";
 
 const CHUNK_TERMINATOR: &str = "0\r\n";
 const CHUNK_TERMINATOR_RAW: &[u8] = b"0\r\n";
@@ -30,7 +34,7 @@ pub mod header_value {
 }
 
 pub trait SignChunk: std::fmt::Debug {
-    fn sign(&mut self, chunk: &Bytes) -> Bytes;
+    fn sign(&mut self, chunk: &Bytes) -> Result<String, SigningError>;
 
     fn sign_trailers(&mut self, trailers: Headers) -> Bytes;
 }
@@ -102,7 +106,7 @@ impl Storable for DeferredSignerSender {
 }
 
 impl SignChunk for DeferredSigner {
-    fn sign(&mut self, chunk: &Bytes) -> Bytes {
+    fn sign(&mut self, chunk: &Bytes) -> Result<String, SigningError> {
         self.acquire().sign(chunk)
     }
 
@@ -278,6 +282,7 @@ pin_project! {
         buffered_trailer: Option<http_1x::HeaderMap>,
         #[pin]
         signer: Option<Box<dyn SignChunk + Send + Sync>>,
+        unsigned: bool,
     }
 }
 
@@ -292,6 +297,7 @@ impl<Inner> AwsChunkedBody<Inner> {
             chunk_buffer: ChunkBuf::Empty,
             buffered_trailer: None,
             signer: None,
+            unsigned: true,
         }
     }
 
@@ -338,6 +344,18 @@ impl<Inner> AwsChunkedBody<Inner> {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Err(_))) => Poll::Ready(false), // break
         }
+    }
+
+    fn signed_chunk(signer: &mut (dyn SignChunk + Send + Sync), chunk_bytes: Bytes) -> Result<Bytes, SigningError> {
+        let chunk_size = format!("{:X}", chunk_bytes.len());
+        let mut chunk = bytes::BytesMut::new();
+        chunk.extend_from_slice(chunk_size.as_bytes());
+        chunk.extend_from_slice(CHUNK_SIGNATURE_BEGIN_RAW);
+        chunk.extend_from_slice(signer.sign(&chunk_bytes)?.as_bytes());
+        chunk.extend_from_slice(CRLF_RAW);
+        chunk.extend_from_slice(&chunk_bytes);
+        chunk.extend_from_slice(CRLF_RAW);
+        Ok(chunk.freeze())
     }
 
     fn unsigned_chunk(chunk_bytes: Bytes) -> Bytes {
@@ -573,7 +591,12 @@ where
                     if this.chunk_buffer.remaining() >= chunk_size {
                         let buf = this.chunk_buffer.buffered();
                         let chunk_bytes = buf.copy_to_bytes(chunk_size);
-                        let chunk = Self::unsigned_chunk(chunk_bytes);
+                        let chunk = if *this.unsigned {
+                            Self::unsigned_chunk(chunk_bytes)
+                        } else {
+                            let signer = this.signer.as_deref_mut().expect("signer must be set");
+                            Self::signed_chunk(signer, chunk_bytes).unwrap()
+                        };
                         return Poll::Ready(Some(Ok(http_body_1x::Frame::data(chunk))));
                     }
 

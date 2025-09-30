@@ -3,10 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::date_time::format_date;
+use crate::{date_time::{format_date, format_date_time}, http_request::SigningError, SigningOutput};
+use aws_credential_types::Credentials;
 use aws_smithy_runtime_api::client::identity::Identity;
+use bytes::Bytes;
 use hmac::{digest::FixedOutput, Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::time::SystemTime;
 
 /// HashedPayload = Lowercase(HexEncode(Hash(requestPayload)))
@@ -189,6 +192,40 @@ pub mod signing_params {
             })
         }
     }
+}
+
+pub fn sign_chunk<'a, S>(
+    chunk: &Bytes,
+    running_signature: &'a str,
+    params: &'a SigningParams<'a, S>,
+) -> Result<SigningOutput<()>, SigningError> {
+    let creds = params
+        .identity
+        .data::<Credentials>()
+        .expect("identity must contain credentials");
+
+    let signing_key = generate_signing_key(
+        creds.secret_access_key(),
+        params.time,
+        params.region,
+        params.name,
+    );
+
+    let mut string_to_sign: Vec<u8> = Vec::new();
+    write!(
+        string_to_sign,
+        "{algorithm}\n{date_time}\n{scope}\n{signature}\n{non_sig}\n{chunk}",
+        algorithm = "AWS4-HMAC-SHA256-PAYLOAD",
+        date_time = format_date_time(params.time),
+        scope = format!("{}/{}/{}/aws4_request", format_date(params.time), params.region, params.name),
+        signature = running_signature,
+        non_sig = sha256_hex_string([]),
+        chunk = sha256_hex_string(chunk),
+    ).unwrap();
+
+    let signature = calculate_signature(signing_key, &string_to_sign);
+    
+    Ok(SigningOutput::new((), signature))
 }
 
 #[cfg(test)]

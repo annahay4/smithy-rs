@@ -11,9 +11,9 @@ use crate::auth::{
 use crate::content_encoding::{DeferredSignerSender, SignChunk};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
-    sign, SignableBody, SignableRequest, SigningParams, SigningSettings,
+    sign, SignableBody, SignableRequest, SigningError, SigningParams, SigningSettings,
 };
-use aws_sigv4::sign::v4;
+use aws_sigv4::sign::v4::{self, sign_chunk};
 use aws_smithy_async::time::SharedTimeSource;
 use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::auth::{
@@ -297,21 +297,28 @@ impl<S> SigV4MessageSigner<S> {
     }
 }
 
-impl SigV4MessageSigner<()> {
-    fn signing_params(&self) -> v4::SigningParams<'_, ()> {
+impl<S> SigV4MessageSigner<S>
+where
+    S: Clone + Default,
+{
+    fn signing_params(&self) -> v4::SigningParams<'_, S> {
         let builder = v4::SigningParams::builder()
             .identity(&self.identity)
             .region(self.signing_region.as_ref())
             .name(self.signing_name.as_ref())
             .time(self.time.now())
-            .settings(());
+            .settings(self.signing_settings.clone());
         builder.build().unwrap()
     }
 }
 
 impl SignChunk for SigV4MessageSigner<SigningSettings> {
-    fn sign(&mut self, bytes: &bytes::Bytes) -> Bytes {
-        todo!()
+    fn sign(&mut self, chunk: &bytes::Bytes) -> Result<String, SigningError> {
+        let params = self.signing_params();
+        let (_, signature) =
+            sign_chunk(chunk, &self.running_signature, &params)?.into_parts();
+        self.running_signature = signature.clone();
+        Ok(signature)
     }
 
     fn sign_trailers(&mut self, trailers: Headers) -> Bytes {
