@@ -4,7 +4,6 @@
  */
 
 use aws_sigv4::http_request::SigningError;
-use aws_smithy_runtime_api::client::auth::Sign;
 use aws_smithy_runtime_api::http::Headers;
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
 use bytes::{Buf, Bytes, BytesMut};
@@ -36,7 +35,7 @@ pub mod header_value {
 pub trait SignChunk: std::fmt::Debug {
     fn sign(&mut self, chunk: &Bytes) -> Result<String, SigningError>;
 
-    fn sign_trailers(&mut self, trailers: Headers) -> Bytes;
+    fn sign_trailers(&mut self, trailers: &Headers) -> Result<String, SigningError>;
 }
 
 #[derive(Debug)]
@@ -110,7 +109,7 @@ impl SignChunk for DeferredSigner {
         self.acquire().sign(chunk)
     }
 
-    fn sign_trailers(&mut self, trailers: Headers) -> Bytes {
+    fn sign_trailers(&mut self, trailers: &Headers) -> Result<String, SigningError> {
         self.acquire().sign_trailers(trailers)
     }
 }
@@ -240,6 +239,10 @@ enum AwsChunkedBodyState {
     /// all data is written out. Once there is no more data to write, transition into the
     /// `WritingTrailers` state.
     WritingChunk,
+    ///
+    WritingZeroSizedSignedChunk,
+    ///
+    PollingTrailers,
     /// Write out all trailers associated with this `AwsChunkedBody` and then transition into the
     /// `Closed` state.
     WritingTrailers,
@@ -346,28 +349,6 @@ impl<Inner> AwsChunkedBody<Inner> {
         }
     }
 
-    fn signed_chunk(signer: &mut (dyn SignChunk + Send + Sync), chunk_bytes: Bytes) -> Result<Bytes, SigningError> {
-        let chunk_size = format!("{:X}", chunk_bytes.len());
-        let mut chunk = bytes::BytesMut::new();
-        chunk.extend_from_slice(chunk_size.as_bytes());
-        chunk.extend_from_slice(CHUNK_SIGNATURE_BEGIN_RAW);
-        chunk.extend_from_slice(signer.sign(&chunk_bytes)?.as_bytes());
-        chunk.extend_from_slice(CRLF_RAW);
-        chunk.extend_from_slice(&chunk_bytes);
-        chunk.extend_from_slice(CRLF_RAW);
-        Ok(chunk.freeze())
-    }
-
-    fn unsigned_chunk(chunk_bytes: Bytes) -> Bytes {
-        let chunk_size = format!("{:X}", chunk_bytes.len());
-        let mut chunk = bytes::BytesMut::new();
-        chunk.extend_from_slice(chunk_size.as_bytes());
-        chunk.extend_from_slice(CRLF_RAW);
-        chunk.extend_from_slice(&chunk_bytes);
-        chunk.extend_from_slice(CRLF_RAW);
-        chunk.freeze()
-    }
-
     fn encoded_length(&self) -> u64 {
         let mut length = 0;
         if self.options.stream_length != 0 {
@@ -403,15 +384,16 @@ where
         tracing::trace!(state = ?self.state, "polling AwsChunkedBody");
         let mut this = self.project();
 
+        use AwsChunkedBodyState::*;
         match *this.state {
-            AwsChunkedBodyState::WritingChunkSize => {
+            WritingChunkSize => {
                 if this.options.stream_length == 0 {
                     // If the stream is empty, we skip to writing trailers after writing the CHUNK_TERMINATOR.
-                    *this.state = AwsChunkedBodyState::WritingTrailers;
+                    *this.state = WritingTrailers;
                     tracing::trace!("stream is empty, writing chunk terminator");
                     Poll::Ready(Some(Ok(Bytes::from([CHUNK_TERMINATOR].concat()))))
                 } else {
-                    *this.state = AwsChunkedBodyState::WritingChunk;
+                    *this.state = WritingChunk;
                     // A chunk must be prefixed by chunk size in hexadecimal
                     let chunk_size = format!("{:X?}{CRLF}", this.options.stream_length);
                     tracing::trace!(%chunk_size, "writing chunk size");
@@ -419,7 +401,7 @@ where
                     Poll::Ready(Some(Ok(chunk_size)))
                 }
             }
-            AwsChunkedBodyState::WritingChunk => match this.inner.poll_data(cx) {
+            WritingChunk => match this.inner.poll_data(cx) {
                 Poll::Ready(Some(Ok(data))) => {
                     tracing::trace!(len = data.len(), "writing chunk data");
                     *this.inner_body_bytes_read_so_far += data.len();
@@ -437,7 +419,7 @@ where
                     };
 
                     tracing::trace!("no more chunk data, writing CRLF and chunk terminator");
-                    *this.state = AwsChunkedBodyState::WritingTrailers;
+                    *this.state = WritingTrailers;
                     // Since we wrote chunk data, we end it with a CRLF and since we only write
                     // a single chunk, we write the CHUNK_TERMINATOR immediately after
                     Poll::Ready(Some(Ok(Bytes::from([CRLF, CHUNK_TERMINATOR].concat()))))
@@ -445,10 +427,10 @@ where
                 Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
                 Poll::Pending => Poll::Pending,
             },
-            AwsChunkedBodyState::WritingTrailers => {
+            WritingZeroSizedSignedChunk | PollingTrailers | WritingTrailers => {
                 return match this.inner.poll_trailers(cx) {
                     Poll::Ready(Ok(trailers)) => {
-                        *this.state = AwsChunkedBodyState::Closed;
+                        *this.state = Closed;
                         let expected_length =
                             http_02x_utils::total_rendered_length_of_trailers(trailers.as_ref());
                         let actual_length = this.options.total_trailer_length();
@@ -475,7 +457,7 @@ where
                     Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
                 };
             }
-            AwsChunkedBodyState::Closed => Poll::Ready(None),
+            Closed => Poll::Ready(None),
         }
     }
 
@@ -592,10 +574,10 @@ where
                         let buf = this.chunk_buffer.buffered();
                         let chunk_bytes = buf.copy_to_bytes(chunk_size);
                         let chunk = if *this.unsigned {
-                            Self::unsigned_chunk(chunk_bytes)
+                            http_1x_utils::unsigned_encoded_chunk(chunk_bytes)
                         } else {
                             let signer = this.signer.as_deref_mut().expect("signer must be set");
-                            Self::signed_chunk(signer, chunk_bytes).unwrap()
+                            http_1x_utils::signed_encoded_chunk(signer, chunk_bytes).unwrap()
                         };
                         return Poll::Ready(Some(Ok(http_body_1x::Frame::data(chunk))));
                     }
@@ -617,34 +599,48 @@ where
                         std::cmp::min(this.chunk_buffer.remaining(), chunk_size);
                     let buf = this.chunk_buffer.buffered();
                     let chunk_bytes = buf.copy_to_bytes(bytes_len_to_read);
-                    let chunk = Self::unsigned_chunk(chunk_bytes);
+                    let chunk = if *this.unsigned {
+                        http_1x_utils::unsigned_encoded_chunk(chunk_bytes)
+                    } else {
+                        let signer = this.signer.as_deref_mut().expect("signer must be set");
+                        http_1x_utils::signed_encoded_chunk(signer, chunk_bytes).unwrap()
+                    };
 
                     return Poll::Ready(Some(Ok(http_body_1x::Frame::data(chunk))));
                 }
 
                 debug_assert!(this.chunk_buffer.remaining() == 0);
 
-                *this.state = WritingTrailers;
+                if *this.unsigned {
+                    *this.state = PollingTrailers;
+                } else {
+                    *this.state = WritingZeroSizedSignedChunk;
+                }
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
-            WritingTrailers => {
-                let mut final_chunk = BytesMut::new();
-                final_chunk.extend_from_slice(CHUNK_TERMINATOR_RAW);
-                if let Some(trailer) = this.buffered_trailer.take() {
-                    final_chunk =
-                        http_1x_utils::trailers_as_aws_chunked_bytes(Some(&trailer), final_chunk)
-                }
-
+            WritingZeroSizedSignedChunk => {
+                let signer = this.signer.as_deref_mut().expect("signer must be set");
+                let final_chunk =
+                    http_1x_utils::signed_encoded_chunk(signer, Bytes::new()).unwrap();
+                *this.state = PollingTrailers;
+                Poll::Ready(Some(Ok(http_body_1x::Frame::data(final_chunk))))
+            }
+            PollingTrailers => {
                 loop {
                     match this.inner.as_mut().poll_frame(cx) {
                         Poll::Ready(Some(Ok(frame))) => {
                             let trailers = frame.into_trailers().ok();
-                            final_chunk = http_1x_utils::trailers_as_aws_chunked_bytes(
-                                trailers.as_ref(),
-                                final_chunk,
-                            );
-                            continue;
+                            if let Some(trailers) = trailers {
+                                match this.buffered_trailer.as_mut().get_mut() {
+                                    Some(existing) => existing.extend(trailers),
+                                    None => {
+                                        *this.buffered_trailer.as_mut().get_mut() = Some(trailers)
+                                    }
+                                }
+                            }
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
                         }
                         Poll::Ready(Some(Err(err))) => {
                             tracing::error!(error = ?err, "error polling inner");
@@ -656,8 +652,49 @@ where
                         Poll::Pending => return Poll::Pending,
                     }
                 }
+                *this.state = WritingTrailers;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            WritingTrailers => {
+                let mut final_chunk = if *this.unsigned {
+                    let mut zero_sized_data = BytesMut::new();
+                    zero_sized_data.extend_from_slice(CHUNK_TERMINATOR_RAW);
+                    zero_sized_data
+                } else {
+                    BytesMut::new()
+                };
+
+                let trailer_bytes = if let Some(mut trailer) = this.buffered_trailer.take() {
+                    let mut trailer_bytes = BytesMut::new();
+                    let trailer = if trailer.is_empty() || *this.unsigned {
+                        trailer
+                    } else {
+                        let signer = this.signer.as_deref_mut().expect("signer must be set");
+                        let signature = signer
+                            .sign_trailers(&Headers::try_from(trailer.clone()).unwrap())
+                            .unwrap();
+                        trailer.insert(
+                            http_1x::header::HeaderName::from_static("x-amz-trailer-signature"),
+                            http_1x::header::HeaderValue::from_str(&signature).unwrap(),
+                        );
+                        trailer
+                    };
+                    trailer_bytes =
+                        http_1x_utils::trailers_as_aws_chunked_bytes(Some(&trailer), trailer_bytes);
+                    trailer_bytes.freeze()
+                } else {
+                    Bytes::new()
+                };
 
                 *this.state = Closed;
+
+                if final_chunk.is_empty() && trailer_bytes.is_empty() {
+                    // Case for signed aws-chunked encoding with no trailers
+                    return Poll::Ready(None);
+                }
+
+                final_chunk.extend_from_slice(&trailer_bytes);
                 final_chunk.extend_from_slice(CRLF_RAW);
                 return Poll::Ready(Some(Ok(http_body_1x::Frame::data(final_chunk.freeze()))));
             }
@@ -669,12 +706,39 @@ where
 mod http_1x_utils {
     use std::task::Poll;
 
+    use crate::content_encoding::{SignChunk, CHUNK_SIGNATURE_BEGIN_RAW};
+
     use super::{CRLF_RAW, TRAILER_SEPARATOR};
+    use aws_sigv4::http_request::SigningError;
     use bytes::{Bytes, BytesMut};
     use http_1x::{HeaderMap, HeaderName};
 
-    /// Writes trailers out into a `string` and then converts that `String` to a `Bytes` before
-    /// returning.
+    pub(super) fn signed_encoded_chunk(
+        signer: &mut (dyn SignChunk + Send + Sync),
+        chunk_bytes: Bytes,
+    ) -> Result<Bytes, SigningError> {
+        let chunk_size = format!("{:X}", chunk_bytes.len());
+        let mut chunk = bytes::BytesMut::new();
+        chunk.extend_from_slice(chunk_size.as_bytes());
+        chunk.extend_from_slice(CHUNK_SIGNATURE_BEGIN_RAW);
+        chunk.extend_from_slice(signer.sign(&chunk_bytes)?.as_bytes());
+        chunk.extend_from_slice(CRLF_RAW);
+        chunk.extend_from_slice(&chunk_bytes);
+        chunk.extend_from_slice(CRLF_RAW);
+        Ok(chunk.freeze())
+    }
+
+    pub(super) fn unsigned_encoded_chunk(chunk_bytes: Bytes) -> Bytes {
+        let chunk_size = format!("{:X}", chunk_bytes.len());
+        let mut chunk = bytes::BytesMut::new();
+        chunk.extend_from_slice(chunk_size.as_bytes());
+        chunk.extend_from_slice(CRLF_RAW);
+        chunk.extend_from_slice(&chunk_bytes);
+        chunk.extend_from_slice(CRLF_RAW);
+        chunk.freeze()
+    }
+
+    /// Writes trailers out into a byte array `buffer`.
     ///
     /// - Trailer names are separated by a single colon only, no space.
     /// - Trailer names with multiple values will be written out one line per value, with the name

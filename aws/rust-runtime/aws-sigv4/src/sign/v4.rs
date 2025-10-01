@@ -5,7 +5,7 @@
 
 use crate::{date_time::{format_date, format_date_time}, http_request::SigningError, SigningOutput};
 use aws_credential_types::Credentials;
-use aws_smithy_runtime_api::client::identity::Identity;
+use aws_smithy_runtime_api::{client::identity::Identity, http::Headers};
 use bytes::Bytes;
 use hmac::{digest::FixedOutput, Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -221,6 +221,50 @@ pub fn sign_chunk<'a, S>(
         signature = running_signature,
         non_sig = sha256_hex_string([]),
         chunk = sha256_hex_string(chunk),
+    ).unwrap();
+
+    let signature = calculate_signature(signing_key, &string_to_sign);
+    
+    Ok(SigningOutput::new((), signature))
+}
+
+pub fn sign_trailer_chunk<'a, S>(
+    headers: &'a Headers,
+    running_signature: &'a str,
+    params: &'a SigningParams<'a, S>,
+) -> Result<SigningOutput<()>, SigningError> {
+    fn canonical_headers(headers: &Headers) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for (name, value) in headers.iter() {
+            buf.extend_from_slice(name.to_lowercase().as_bytes());
+            buf.extend_from_slice(b":");
+            buf.extend_from_slice(value.trim().as_bytes());
+            buf.extend_from_slice(b"\n");
+        }
+        buf
+    }
+
+    let creds = params
+        .identity
+        .data::<Credentials>()
+        .expect("identity must contain credentials");
+
+    let signing_key = generate_signing_key(
+        creds.secret_access_key(),
+        params.time,
+        params.region,
+        params.name,
+    );
+
+    let mut string_to_sign: Vec<u8> = Vec::new();
+    write!(
+        string_to_sign,
+        "{algorithm}\n{date_time}\n{scope}\n{signature}\n{trailer}",
+        algorithm = "AWS4-HMAC-SHA256-TRAILER",
+        date_time = format_date_time(params.time),
+        scope = format!("{}/{}/{}/aws4_request", format_date(params.time), params.region, params.name),
+        signature = running_signature,
+        trailer = sha256_hex_string(canonical_headers(headers)),
     ).unwrap();
 
     let signature = calculate_signature(signing_key, &string_to_sign);

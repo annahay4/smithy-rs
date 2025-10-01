@@ -13,7 +13,7 @@ use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     sign, SignableBody, SignableRequest, SigningError, SigningParams, SigningSettings,
 };
-use aws_sigv4::sign::v4::{self, sign_chunk};
+use aws_sigv4::sign::v4::{self, sign_chunk, sign_trailer_chunk};
 use aws_smithy_async::time::SharedTimeSource;
 use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::auth::{
@@ -315,14 +315,17 @@ where
 impl SignChunk for SigV4MessageSigner<SigningSettings> {
     fn sign(&mut self, chunk: &bytes::Bytes) -> Result<String, SigningError> {
         let params = self.signing_params();
-        let (_, signature) =
-            sign_chunk(chunk, &self.running_signature, &params)?.into_parts();
+        let (_, signature) = sign_chunk(chunk, &self.running_signature, &params)?.into_parts();
         self.running_signature = signature.clone();
         Ok(signature)
     }
 
-    fn sign_trailers(&mut self, trailers: Headers) -> Bytes {
-        todo!()
+    fn sign_trailers(&mut self, trailers: &Headers) -> Result<String, SigningError> {
+        let params = self.signing_params();
+        let (_, signature) =
+            sign_trailer_chunk(trailers, &self.running_signature, &params)?.into_parts();
+        self.running_signature = signature.clone();
+        Ok(signature)
     }
 }
 
