@@ -278,7 +278,7 @@ pub(crate) struct SigV4MessageSigner<S> {
 }
 
 impl<S> SigV4MessageSigner<S> {
-    fn new(
+    pub(crate) fn new(
         running_signature: String,
         identity: Identity,
         signing_region: SigningRegion,

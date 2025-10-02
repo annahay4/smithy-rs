@@ -310,6 +310,7 @@ impl<Inner> AwsChunkedBody<Inner> {
     where
         S: SignChunk + Send + Sync + 'static,
     {
+        self.unsigned = false;
         self.signer = Some(Box::new(signer));
         self
     }
@@ -621,10 +622,19 @@ where
             }
             WritingZeroSizedSignedChunk => {
                 let signer = this.signer.as_deref_mut().expect("signer must be set");
-                let final_chunk =
+                let zero_sized_chunk =
                     http_1x_utils::signed_encoded_chunk(signer, Bytes::new()).unwrap();
-                *this.state = PollingTrailers;
-                Poll::Ready(Some(Ok(http_body_1x::Frame::data(final_chunk))))
+                if this.buffered_trailer.is_some() {
+                    *this.state = PollingTrailers;
+                    let mut zero_sized_chunk = BytesMut::from(&zero_sized_chunk[..]);
+                    debug_assert!(zero_sized_chunk.ends_with(b"\r\n\r\n"));
+                    zero_sized_chunk.truncate(zero_sized_chunk.len() - 2);
+                    let zero_sized_chunk = zero_sized_chunk.freeze();
+                    return Poll::Ready(Some(Ok(http_body_1x::Frame::data(zero_sized_chunk))));
+                } else {
+                    *this.state = Closed;
+                    return Poll::Ready(Some(Ok(http_body_1x::Frame::data(zero_sized_chunk))));
+                }
             }
             PollingTrailers => {
                 loop {
@@ -1210,6 +1220,36 @@ mod tests {
             }
         }
 
+        // Custom body that returns data and trailers
+        pin_project! {
+            struct TestBodyWithTrailers {
+                data: Option<Bytes>,
+                trailers: Option<HeaderMap>,
+            }
+        }
+
+        impl Body for TestBodyWithTrailers {
+            type Data = Bytes;
+            type Error = aws_smithy_types::body::Error;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body_1x::Frame<Self::Data>, Self::Error>>> {
+                let this = self.project();
+
+                if let Some(data) = this.data.take() {
+                    return Poll::Ready(Some(Ok(http_body_1x::Frame::data(data))));
+                }
+
+                if let Some(trailers) = this.trailers.take() {
+                    return Poll::Ready(Some(Ok(http_body_1x::Frame::trailers(trailers))));
+                }
+
+                Poll::Ready(None)
+            }
+        }
+
         #[tokio::test]
         async fn test_aws_chunked_encoding() {
             let test_fut = async {
@@ -1413,39 +1453,9 @@ mod tests {
 
         #[tokio::test]
         async fn test_poll_frame_with_trailers() {
-            // A body that returns one data frame and one trailers frame
-            pin_project! {
-                struct TestBody {
-                    data: Option<Bytes>,
-                    trailers: Option<HeaderMap>,
-                }
-            }
-
-            impl Body for TestBody {
-                type Data = Bytes;
-                type Error = aws_smithy_types::body::Error;
-
-                fn poll_frame(
-                    self: Pin<&mut Self>,
-                    _cx: &mut Context<'_>,
-                ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-                    let this = self.project();
-
-                    if let Some(data) = this.data.take() {
-                        return Poll::Ready(Some(Ok(Frame::data(data))));
-                    }
-
-                    if let Some(trailers) = this.trailers.take() {
-                        return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
-                    }
-
-                    Poll::Ready(None)
-                }
-            }
-
             let mut trailers = HeaderMap::new();
             trailers.insert("x-amz-checksum-crc32", HeaderValue::from_static("78DeVw=="));
-            let body = TestBody {
+            let body = TestBodyWithTrailers {
                 data: Some(Bytes::from("1234567890123456789012345")),
                 trailers: Some(trailers),
             };
@@ -1467,6 +1477,128 @@ mod tests {
                 Bytes::from_static(b"0\r\nx-amz-checksum-crc32:78DeVw==\r\n\r\n"),
                 data_frames[3]
             );
+        }
+
+        // Testing scenario derived from https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming.html
+        #[tokio::test]
+        async fn test_aws_chunked_body_poll_frame_with_signer() {
+            use crate::auth::sigv4::SigV4MessageSigner;
+            use aws_credential_types::Credentials;
+            use aws_sigv4::http_request::SigningSettings;
+            use aws_smithy_async::time::{SharedTimeSource, StaticTimeSource};
+            use aws_types::region::SigningRegion;
+            use aws_types::SigningName;
+            use std::time::{Duration, UNIX_EPOCH};
+
+            // 65KB of 'a' characters
+            let data = "a".repeat(65 * 1024);
+            let inner_body = SdkBody::from(data);
+
+            // `StaticTimeSource` for 20130524T000000Z
+            let time = StaticTimeSource::new(UNIX_EPOCH + Duration::from_secs(1369353600));
+            let shared_time = SharedTimeSource::from(time);
+
+            let credentials = Credentials::new(
+                "AKIAIOSFODNN7EXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                None,
+                None,
+                "test",
+            );
+
+            let seed_signature =
+                "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9".to_owned();
+            let signer = SigV4MessageSigner::new(
+                seed_signature,
+                credentials.into(),
+                SigningRegion::from_static("us-east-1"),
+                SigningName::from_static("s3"),
+                shared_time,
+                SigningSettings::default(),
+            );
+
+            let mut chunked_body =
+                AwsChunkedBody::new(inner_body, AwsChunkedBodyOptions::default())
+                    .with_signer(signer);
+
+            let mut data_frames = Vec::new();
+            while let Some(frame) = chunked_body.frame().await.transpose().unwrap() {
+                if let Ok(data) = frame.into_data() {
+                    data_frames.push(data);
+                }
+            }
+
+            assert_eq!(3, data_frames.len()); // 64 KB, 1 KB, and the final chunk with 0 bytes of chunk data.
+            assert!(data_frames[0].starts_with(b"10000;chunk-signature=ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648\r\n"));
+            assert!(data_frames[1].starts_with(b"400;chunk-signature=0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497\r\n"));
+            assert_eq!(data_frames[2], Bytes::from_static(b"0;chunk-signature=b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9\r\n\r\n"));
+        }
+
+        // Testing scenario derived from https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming-trailers.html
+        #[tokio::test]
+        async fn test_aws_chunked_body_poll_frame_with_signer_and_trailers() {
+            use crate::auth::sigv4::SigV4MessageSigner;
+            use aws_credential_types::Credentials;
+            use aws_sigv4::http_request::SigningSettings;
+            use aws_smithy_async::time::{SharedTimeSource, StaticTimeSource};
+            use aws_types::region::SigningRegion;
+            use aws_types::SigningName;
+            use std::time::{Duration, UNIX_EPOCH};
+
+            // 65KB of 'a' characters
+            let data = "a".repeat(65 * 1024);
+
+            // Set trailers with x-amz-checksum-crc32c header
+            let mut trailers = HeaderMap::new();
+            trailers.insert(
+                "x-amz-checksum-crc32c",
+                HeaderValue::from_static("sOO8/Q=="),
+            );
+
+            let inner_body = TestBodyWithTrailers {
+                data: Some(Bytes::from(data)),
+                trailers: Some(trailers),
+            };
+
+            // `StaticTimeSource` for 20130524T000000Z
+            let time = StaticTimeSource::new(UNIX_EPOCH + Duration::from_secs(1369353600));
+            let shared_time = SharedTimeSource::from(time);
+
+            let credentials = Credentials::new(
+                "AKIAIOSFODNN7EXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                None,
+                None,
+                "test",
+            );
+
+            let seed_signature =
+                "106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e".to_owned();
+            let signer = SigV4MessageSigner::new(
+                seed_signature,
+                credentials.into(),
+                SigningRegion::from_static("us-east-1"),
+                SigningName::from_static("s3"),
+                shared_time,
+                SigningSettings::default(),
+            );
+
+            let mut chunked_body =
+                AwsChunkedBody::new(inner_body, AwsChunkedBodyOptions::default())
+                    .with_signer(signer);
+
+            let mut data_frames = Vec::new();
+            while let Some(frame) = chunked_body.frame().await.transpose().unwrap() {
+                if let Ok(data) = frame.into_data() {
+                    data_frames.push(data);
+                }
+            }
+
+            assert_eq!(4, data_frames.len()); // 64 KB, 1 KB, 0 bytes of chunk data, and the trailer chunk.
+            assert!(data_frames[0].starts_with(b"10000;chunk-signature=b474d8862b1487a5145d686f57f013e54db672cee1c953b3010fb58501ef5aa2\r\n"));
+            assert!(data_frames[1].starts_with(b"400;chunk-signature=1c1344b170168f8e65b41376b44b20fe354e373826ccbbe2c1d40a8cae51e5c7\r\n"));
+            assert_eq!(data_frames[2], Bytes::from_static(b"0;chunk-signature=2ca2aba2005185cf7159c6277faf83795951dd77a3a99e6e65d5c9f85863f992\r\n"));
+            assert_eq!(data_frames[3], Bytes::from_static(b"x-amz-checksum-crc32c:sOO8/Q==\r\nx-amz-trailer-signature:d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca17fe2e435\r\n\r\n"));
         }
     }
 }
