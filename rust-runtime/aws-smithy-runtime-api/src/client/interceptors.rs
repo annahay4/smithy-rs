@@ -55,6 +55,25 @@ macro_rules! interceptor_trait_fn {
     };
 }
 
+/// A struct representing the order of an interceptor.
+#[derive(Debug, Default, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub struct InterceptOrder(i32);
+
+impl InterceptOrder {
+    /// Create a new `InterceptOrder` that whose interceptor runs after the given order.
+    pub const fn after(other: InterceptOrder) -> Self {
+        InterceptOrder(other.0 + 1)
+    }
+}
+
+/// Trait for interceptors that have a compile-time order
+pub trait OrderIntercept {
+    /// The execution order for this interceptor type.
+    /// Lower order values execute before higher order values.
+    /// Default is 0. Negative values can be used for early execution.
+    const ORDER: InterceptOrder = InterceptOrder(0);
+}
+
 /// An interceptor allows injecting code into the SDK ’s request execution pipeline.
 ///
 /// ## Terminology:
@@ -65,6 +84,7 @@ macro_rules! interceptor_trait_fn {
 ///   of the SDK ’s request execution pipeline. Hooks are either "read" hooks, which make it possible
 ///   to read in-flight request or response messages, or "read/write" hooks, which make it possible
 ///   to modify in-flight request or output messages.
+
 pub trait Intercept: fmt::Debug + Send + Sync {
     /// The name of this interceptor, used in error messages for debugging.
     fn name(&self) -> &'static str;
@@ -592,6 +612,7 @@ pub trait Intercept: fmt::Debug + Send + Sync {
 pub struct SharedInterceptor {
     interceptor: Arc<dyn Intercept>,
     check_enabled: Arc<dyn Fn(&ConfigBag) -> bool + Send + Sync>,
+    order: InterceptOrder,
 }
 
 impl fmt::Debug for SharedInterceptor {
@@ -606,6 +627,7 @@ impl SharedInterceptor {
     /// Create a new `SharedInterceptor` from `Interceptor`.
     pub fn new<T: Intercept + 'static>(interceptor: T) -> Self {
         Self {
+            order: InterceptOrder::default(),
             interceptor: Arc::new(interceptor),
             check_enabled: Arc::new(|conf: &ConfigBag| {
                 conf.load::<DisableInterceptor<T>>().is_none()
@@ -613,9 +635,25 @@ impl SharedInterceptor {
         }
     }
 
+    #[allow(dead_code)]
+    // Convenience constructor for `SharedInterceptor` with order from `OrderIntercept` trait.
+    pub(crate) fn new_with_order<T: Intercept + OrderIntercept + 'static>(interceptor: T) -> Self {
+        Self::new(interceptor).with_order(T::ORDER)
+    }
+
+    pub(crate) fn with_order(mut self, order: InterceptOrder) -> Self {
+        self.order = order;
+        self
+    }
+
     /// Checks if this interceptor is enabled in the given config.
     pub fn enabled(&self, conf: &ConfigBag) -> bool {
         (self.check_enabled)(conf)
+    }
+
+    /// Get the execution order for this interceptor.
+    pub fn order(&self) -> InterceptOrder {
+        self.order
     }
 }
 
@@ -840,5 +878,109 @@ pub fn disable_interceptor<T: Intercept>(cause: &'static str) -> DisableIntercep
     DisableInterceptor {
         _t: PhantomData,
         cause,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestInterceptor;
+
+    impl Intercept for TestInterceptor {
+        fn name(&self) -> &'static str {
+            "TestInterceptor"
+        }
+    }
+
+    #[derive(Debug)]
+    struct CustomOrderInterceptor;
+
+    impl Intercept for CustomOrderInterceptor {
+        fn name(&self) -> &'static str {
+            "CustomOrderInterceptor"
+        }
+    }
+
+    impl OrderIntercept for CustomOrderInterceptor {
+        const ORDER: InterceptOrder = InterceptOrder(100);
+    }
+
+    #[derive(Debug)]
+    struct HighOrderInterceptor;
+
+    impl Intercept for HighOrderInterceptor {
+        fn name(&self) -> &'static str {
+            "HighOrderInterceptor"
+        }
+    }
+
+    impl OrderIntercept for HighOrderInterceptor {
+        const ORDER: InterceptOrder = InterceptOrder::after(CustomOrderInterceptor::ORDER);
+    }
+
+    #[derive(Debug)]
+    struct LowOrderInterceptor;
+
+    impl Intercept for LowOrderInterceptor {
+        fn name(&self) -> &'static str {
+            "LowOrderInterceptor"
+        }
+    }
+
+    impl OrderIntercept for LowOrderInterceptor {
+        const ORDER: InterceptOrder = InterceptOrder(CustomOrderInterceptor::ORDER.0 - 50);
+    }
+
+    #[test]
+    fn test_shared_interceptor_default_order() {
+        let interceptor = SharedInterceptor::new(TestInterceptor);
+        assert_eq!(InterceptOrder(0), interceptor.order());
+    }
+
+    #[test]
+    fn test_shared_interceptor_custom_order() {
+        let interceptor = SharedInterceptor::new_with_order(CustomOrderInterceptor);
+        assert_eq!(InterceptOrder(100), interceptor.order());
+    }
+
+    #[test]
+    fn test_shared_interceptor_sorting() {
+        let mut interceptors = vec![
+            SharedInterceptor::new_with_order(HighOrderInterceptor),
+            SharedInterceptor::new(TestInterceptor), // order 0
+            SharedInterceptor::new_with_order(LowOrderInterceptor),
+            SharedInterceptor::new_with_order(CustomOrderInterceptor), // order 100
+        ];
+
+        interceptors.sort_by_key(|i| i.order().clone());
+
+        let orders: Vec<i32> = interceptors.iter().map(|i| i.order().0).collect();
+        assert_eq!(orders, vec![0, 50, 100, 101]);
+    }
+
+    #[test]
+    fn test_shared_interceptor_stable_sort() {
+        #[derive(Debug)]
+        struct TestInterceptor2;
+        impl Intercept for TestInterceptor2 {
+            fn name(&self) -> &'static str {
+                "TestInterceptor2"
+            }
+        }
+
+        let mut interceptors = vec![
+            SharedInterceptor::new(TestInterceptor), // First with order 0
+            SharedInterceptor::new_with_order(CustomOrderInterceptor), // order 42
+            SharedInterceptor::new(TestInterceptor2), // Second with order 0
+        ];
+
+        interceptors.sort_by_key(|i| i.order().clone());
+
+        // Verify stable sort: same order values maintain original relative positions
+        assert_eq!(interceptors[0].name(), "TestInterceptor");
+        assert_eq!(interceptors[1].name(), "TestInterceptor2");
+        assert_eq!(interceptors[2].name(), "CustomOrderInterceptor");
     }
 }

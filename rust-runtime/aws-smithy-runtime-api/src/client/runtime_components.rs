@@ -20,7 +20,7 @@ use crate::client::http::{HttpClient, SharedHttpClient};
 use crate::client::identity::{
     ResolveCachedIdentity, ResolveIdentity, SharedIdentityCache, SharedIdentityResolver,
 };
-use crate::client::interceptors::{Intercept, SharedInterceptor};
+use crate::client::interceptors::{Intercept, OrderIntercept, SharedInterceptor};
 use crate::client::retries::classifiers::{ClassifyRetry, SharedRetryClassifier};
 use crate::client::retries::{RetryStrategy, SharedRetryStrategy};
 use crate::impl_shared_conversions;
@@ -707,6 +707,18 @@ impl RuntimeComponentsBuilder {
     pub fn push_interceptor(&mut self, interceptor: impl Intercept + 'static) -> &mut Self {
         self.interceptors
             .push(Tracked::new(self.builder_name, interceptor.into_shared()));
+        self
+    }
+
+    /// Adds an interceptor with a specific order.
+    pub fn push_interceptor_ordered<T>(&mut self, interceptor: T) -> &mut Self
+    where
+        T: Intercept + OrderIntercept + 'static,
+    {
+        let shared: SharedInterceptor = interceptor.into_shared();
+        let shared = shared.with_order(T::ORDER);
+        self.interceptors
+            .push(Tracked::new(self.builder_name, shared));
         self
     }
 

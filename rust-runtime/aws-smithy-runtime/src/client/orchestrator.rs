@@ -185,10 +185,16 @@ fn apply_configuration(
     cfg: &mut ConfigBag,
     runtime_plugins: &RuntimePlugins,
 ) -> Result<RuntimeComponents, BoxError> {
-    let client_rc_builder = runtime_plugins.apply_client_configuration(cfg)?;
-    continue_on_err!([ctx] => Interceptors::new(client_rc_builder.interceptors()).read_before_execution(false, ctx, cfg));
+    let mut client_rc_builder = runtime_plugins.apply_client_configuration(cfg)?;
+    let mut client_interceptors = client_rc_builder.interceptors().collect::<Vec<_>>();
+    client_interceptors.sort_by_key(|i| i.order());
+    client_rc_builder.set_interceptors(client_interceptors.into_iter());
+    continue_on_err!([ctx] => Interceptors::new(client_rc_builder.interceptors()).read_before_execution(true, ctx, cfg));
 
-    let operation_rc_builder = runtime_plugins.apply_operation_configuration(cfg)?;
+    let mut operation_rc_builder = runtime_plugins.apply_operation_configuration(cfg)?;
+    let mut operation_interceptors = operation_rc_builder.interceptors().collect::<Vec<_>>();
+    operation_interceptors.sort_by_key(|i| i.order());
+    operation_rc_builder.set_interceptors(operation_interceptors.into_iter());
     continue_on_err!([ctx] => Interceptors::new(operation_rc_builder.interceptors()).read_before_execution(true, ctx, cfg));
 
     // The order below is important. Client interceptors must run before operation interceptors.
