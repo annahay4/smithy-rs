@@ -84,7 +84,6 @@ pub trait OrderIntercept {
 ///   of the SDK ’s request execution pipeline. Hooks are either "read" hooks, which make it possible
 ///   to read in-flight request or response messages, or "read/write" hooks, which make it possible
 ///   to modify in-flight request or output messages.
-
 pub trait Intercept: fmt::Debug + Send + Sync {
     /// The name of this interceptor, used in error messages for debugging.
     fn name(&self) -> &'static str;
