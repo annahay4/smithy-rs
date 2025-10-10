@@ -9,26 +9,20 @@
 
 use crate::presigning::PresigningMarker;
 use aws_runtime::auth::PayloadSigningOverride;
-use aws_runtime::content_encoding::header_value::AWS_CHUNKED;
-use aws_runtime::content_encoding::{AwsChunkedBody, AwsChunkedBodyOptions};
+use aws_smithy_checksums::body::calculate;
 use aws_smithy_checksums::body::ChecksumCache;
 use aws_smithy_checksums::ChecksumAlgorithm;
-use aws_smithy_checksums::{body::calculate, http::HttpChecksum};
 use aws_smithy_runtime::client::sdk_feature::SmithySdkFeature;
 use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::interceptors::context::{
     BeforeSerializationInterceptorContextMut, BeforeTransmitInterceptorContextMut, Input,
 };
 use aws_smithy_runtime_api::client::interceptors::Intercept;
-use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_runtime_api::http::Request;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::checksum_config::RequestChecksumCalculation;
-use aws_smithy_types::config_bag::{ConfigBag, Layer, Storable, StoreReplace};
-use aws_smithy_types::error::operation::BuildError;
-use http_1x::HeaderValue;
-use http_body_1x::Body;
+use aws_smithy_types::config_bag::{ConfigBag, Storable, StoreReplace};
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -151,14 +145,13 @@ where
         let (checksum_algorithm, request_checksum_required) =
             (self.algorithm_provider)(context.input());
 
-        let mut layer = Layer::new("RequestChecksumInterceptor");
-        layer.store_put(RequestChecksumInterceptorState {
-            checksum_algorithm,
-            request_checksum_required,
-            checksum_cache: ChecksumCache::new(),
-            calculate_checksum: Arc::new(AtomicBool::new(false)),
-        });
-        cfg.push_layer(layer);
+        cfg.interceptor_state()
+            .store_put(RequestChecksumInterceptorState {
+                checksum_algorithm,
+                request_checksum_required,
+                checksum_cache: ChecksumCache::new(),
+                calculate_checksum: Arc::new(AtomicBool::new(false)),
+            });
 
         Ok(())
     }
@@ -258,8 +251,7 @@ where
     }
 
     /// Calculate a checksum and modify the request to include the checksum as a header
-    /// (for in-memory request bodies) or a trailer (for streaming request bodies).
-    /// Streaming bodies must be sized or this will return an error.
+    /// for signing with in-memory request bodies.
     fn modify_before_signing(
         &self,
         context: &mut BeforeTransmitInterceptorContextMut<'_>,
@@ -270,7 +262,10 @@ where
             .load::<RequestChecksumInterceptorState>()
             .expect("set in `read_before_serialization`");
 
-        let checksum_cache = state.checksum_cache.clone();
+        let calculate_checksum = state.calculate_checksum.load(Ordering::SeqCst);
+        if !calculate_checksum {
+            return Ok(());
+        }
 
         let checksum_algorithm = state
             .checksum_algorithm
@@ -278,18 +273,103 @@ where
             .map(|s| ChecksumAlgorithm::from_str(s.as_str()))
             .transpose()?;
 
-        let calculate_checksum = state.calculate_checksum.load(Ordering::SeqCst);
-
         // Calculate the checksum if necessary
-        if calculate_checksum {
-            // If a checksum override is set in the ConfigBag we use that instead (currently only used by S3Express)
-            // If we have made it this far without a checksum being set we set the default (currently Crc32)
-            let checksum_algorithm =
-                incorporate_custom_default(checksum_algorithm, cfg).unwrap_or_default();
+        // If a checksum override is set in the ConfigBag we use that instead (currently only used by S3Express)
+        // If we have made it this far without a checksum being set we set the default (currently Crc32)
+        let checksum_algorithm =
+            incorporate_custom_default(checksum_algorithm, cfg).unwrap_or_default();
 
-            let request = context.request_mut();
-            add_checksum_for_request_body(request, checksum_algorithm, checksum_cache, cfg)?;
+        let checksum_cache = state.checksum_cache.clone();
+
+        // If the body is streaming, bail out since body signing won't take place
+        if context.request().body().bytes().is_none() {
+            // Update state to remember the resolved `checksum_algorithm`
+            let mut state = state.clone();
+            state.checksum_algorithm = Some(checksum_algorithm.as_str().to_owned());
+            cfg.interceptor_state().store_put(state);
+
+            // This could be STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER depending on signing settings,
+            // as we decouple checksum calculation from aws-chunked encoding.
+            cfg.interceptor_state()
+                .store_put(PayloadSigningOverride::StreamingUnsignedPayloadTrailer);
+            return Ok(());
         }
+
+        let request = context.request_mut();
+        let data = request.body().bytes().expect("non-streaming body");
+
+        let mut checksum = checksum_algorithm.into_impl();
+
+        // If the header has not already been set we set it. If it was already set by the user
+        // we do nothing and maintain their set value.
+        if request.headers().get(checksum.header_name()).is_none() {
+            tracing::debug!("applying {checksum_algorithm:?} of the request body as a header");
+            checksum.update(data);
+
+            let calculated_headers = checksum.headers();
+            let checksum_headers = if let Some(cached_headers) = checksum_cache.get() {
+                if cached_headers != calculated_headers {
+                    tracing::warn!(cached = ?cached_headers, calculated = ?calculated_headers, "calculated checksum differs from cached checksum!");
+                }
+                cached_headers
+            } else {
+                checksum_cache.set(calculated_headers.clone());
+                calculated_headers
+            };
+
+            for (hdr_name, hdr_value) in checksum_headers.iter() {
+                request
+                    .headers_mut()
+                    .insert(hdr_name.clone(), hdr_value.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn modify_before_transmit(
+        &self,
+        ctx: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let request = ctx.request_mut();
+        if request.body().bytes().is_some() {
+            // Nothing to do for non-streaming bodies since the checksum was added to the the header
+            // in `modify_before_signing` and signing has already been done by the time this hook is called.
+            return Ok(());
+        }
+
+        let state = cfg
+            .load::<RequestChecksumInterceptorState>()
+            .expect("set in `read_before_serialization`");
+        let checksum_algorithm = state
+            .checksum_algorithm
+            .clone()
+            .map(|s| ChecksumAlgorithm::from_str(s.as_str()))
+            .transpose()?
+            .expect("set in `modify_before_signing`");
+
+        let checksum = checksum_algorithm.into_impl();
+        request.headers_mut().insert(
+            http_1x::header::HeaderName::from_static("x-amz-trailer"),
+            checksum.header_name(),
+        );
+
+        let mut body = {
+            let body = mem::replace(request.body_mut(), SdkBody::taken());
+            let checksum_cache = state.checksum_cache.clone();
+
+            body.map(move |body| {
+                let checksum = checksum_algorithm.into_impl();
+                let body =
+                    calculate::ChecksumBody::new(body, checksum).with_cache(checksum_cache.clone());
+
+                SdkBody::from_body_1_x(body)
+            })
+        };
+
+        mem::swap(request.body_mut(), &mut body);
 
         Ok(())
     }
@@ -333,128 +413,9 @@ fn incorporate_custom_default(
         None => checksum,
     }
 }
-
-fn add_checksum_for_request_body(
-    request: &mut HttpRequest,
-    checksum_algorithm: ChecksumAlgorithm,
-    checksum_cache: ChecksumCache,
-    cfg: &mut ConfigBag,
-) -> Result<(), BoxError> {
-    match request.body().bytes() {
-        // Body is in-memory: read it and insert the checksum as a header.
-        Some(data) => {
-            let mut checksum = checksum_algorithm.into_impl();
-
-            // If the header has not already been set we set it. If it was already set by the user
-            // we do nothing and maintain their set value.
-            if request.headers().get(checksum.header_name()).is_none() {
-                tracing::debug!("applying {checksum_algorithm:?} of the request body as a header");
-                checksum.update(data);
-
-                let calculated_headers = checksum.headers();
-                let checksum_headers = if let Some(cached_headers) = checksum_cache.get() {
-                    if cached_headers != calculated_headers {
-                        tracing::warn!(cached = ?cached_headers, calculated = ?calculated_headers, "calculated checksum differs from cached checksum!");
-                    }
-                    cached_headers
-                } else {
-                    checksum_cache.set(calculated_headers.clone());
-                    calculated_headers
-                };
-
-                for (hdr_name, hdr_value) in checksum_headers.iter() {
-                    request
-                        .headers_mut()
-                        .insert(hdr_name.clone(), hdr_value.clone());
-                }
-            }
-        }
-        // Body is streaming: wrap the body so it will emit a checksum as a trailer.
-        None => {
-            tracing::debug!("applying {checksum_algorithm:?} of the request body as a trailer");
-            cfg.interceptor_state()
-                .store_put(PayloadSigningOverride::StreamingUnsignedPayloadTrailer);
-            wrap_streaming_request_body_in_checksum_calculating_body(
-                request,
-                checksum_algorithm,
-                checksum_cache.clone(),
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn wrap_streaming_request_body_in_checksum_calculating_body(
-    request: &mut HttpRequest,
-    checksum_algorithm: ChecksumAlgorithm,
-    checksum_cache: ChecksumCache,
-) -> Result<(), BuildError> {
-    let checksum = checksum_algorithm.into_impl();
-
-    // If the user already set the header value then do nothing and return early
-    if request.headers().get(checksum.header_name()).is_some() {
-        return Ok(());
-    }
-
-    let original_body_size = request
-        .body()
-        .size_hint()
-        .exact()
-        .ok_or_else(|| BuildError::other(Error::UnsizedRequestBody))?;
-
-    let mut body = {
-        let body = mem::replace(request.body_mut(), SdkBody::taken());
-
-        body.map(move |body| {
-            let checksum = checksum_algorithm.into_impl();
-            let trailer_len = HttpChecksum::size(checksum.as_ref());
-            let body =
-                calculate::ChecksumBody::new(body, checksum).with_cache(checksum_cache.clone());
-            let aws_chunked_body_options =
-                AwsChunkedBodyOptions::new(original_body_size, vec![trailer_len]);
-            let body = AwsChunkedBody::new(body, aws_chunked_body_options);
-
-            SdkBody::from_body_1_x(body)
-        })
-    };
-
-    let encoded_content_length = body
-        .size_hint()
-        .exact()
-        .ok_or_else(|| BuildError::other(Error::UnsizedRequestBody))?;
-
-    let headers = request.headers_mut();
-
-    headers.insert(
-        http_1x::header::HeaderName::from_static("x-amz-trailer"),
-        checksum.header_name(),
-    );
-
-    headers.insert(
-        http_1x::header::CONTENT_LENGTH,
-        HeaderValue::from(encoded_content_length),
-    );
-    headers.insert(
-        http_1x::header::HeaderName::from_static("x-amz-decoded-content-length"),
-        HeaderValue::from(original_body_size),
-    );
-    // The target service does not depend on where `aws-chunked` appears in the `Content-Encoding` header,
-    // as it will ultimately be stripped.
-    headers.append(
-        http_1x::header::CONTENT_ENCODING,
-        HeaderValue::from_str(AWS_CHUNKED)
-            .map_err(BuildError::other)
-            .expect("\"aws-chunked\" will always be a valid HeaderValue"),
-    );
-
-    mem::swap(request.body_mut(), &mut body);
-
-    Ok(())
-}
-
+/*
 #[cfg(test)]
 mod tests {
-    use crate::http_request_checksum::wrap_streaming_request_body_in_checksum_calculating_body;
     use aws_smithy_checksums::body::ChecksumCache;
     use aws_smithy_checksums::ChecksumAlgorithm;
     use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
@@ -559,3 +520,4 @@ mod tests {
         );
     }
 }
+*/
