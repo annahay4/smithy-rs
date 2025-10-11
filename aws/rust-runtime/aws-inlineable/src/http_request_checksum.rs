@@ -56,7 +56,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 #[derive(Debug, Clone)]
-struct RequestChecksumInterceptorState {
+pub(crate) struct RequestChecksumInterceptorState {
     /// The checksum algorithm to calculate
     checksum_algorithm: Option<String>,
     /// This value is set in the model on the `httpChecksum` trait
@@ -64,6 +64,17 @@ struct RequestChecksumInterceptorState {
     calculate_checksum: Arc<AtomicBool>,
     checksum_cache: ChecksumCache,
 }
+
+impl RequestChecksumInterceptorState {
+    pub(crate) fn checksum_algorithm(&self) -> Option<ChecksumAlgorithm> {
+        self.checksum_algorithm
+            .clone()
+            .map(|s| ChecksumAlgorithm::from_str(s.as_str()))
+            .transpose()
+            .expect("known checksum algorighm")
+    }
+}
+
 impl Storable for RequestChecksumInterceptorState {
     type Storer = StoreReplace<Self>;
 }
