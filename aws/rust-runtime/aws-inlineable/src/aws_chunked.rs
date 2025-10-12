@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#![allow(dead_code)]
+
 use aws_runtime::content_encoding::{
     header_value::AWS_CHUNKED, AwsChunkedBody, AwsChunkedBodyOptions, DeferredSigner,
 };
@@ -10,7 +12,10 @@ use aws_smithy_checksums::http::HttpChecksum;
 use aws_smithy_runtime_api::{
     box_error::BoxError,
     client::{
-        interceptors::{context::{BeforeTransmitInterceptorContextMut, BeforeTransmitInterceptorContextRef}, Intercept},
+        interceptors::{
+            context::{BeforeTransmitInterceptorContextMut, BeforeTransmitInterceptorContextRef},
+            Intercept,
+        },
         runtime_components::RuntimeComponents,
     },
 };
@@ -20,6 +25,12 @@ use http_body_1x::Body;
 
 #[derive(Debug)]
 pub(crate) struct AwsChunkedContentEncodingInterceptor;
+
+impl AwsChunkedContentEncodingInterceptor {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
 
 impl Intercept for AwsChunkedContentEncodingInterceptor {
     fn name(&self) -> &'static str {
