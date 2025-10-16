@@ -162,14 +162,13 @@ impl AwsChunkedBodyOptions {
         self
     }
 
-        pub fn encoded_length(&self) -> u64 {
+    pub fn encoded_length(&self) -> u64 {
         let mut length = 0;
 
         let number_of_data_chunks = self.stream_length / self.chunk_size() as u64;
         let remaining_data_chunk = self.stream_length % self.chunk_size() as u64;
 
-        length = number_of_data_chunks
-            * get_unsigned_chunk_bytes_length(self.chunk_size() as u64)
+        length = number_of_data_chunks * get_unsigned_chunk_bytes_length(self.chunk_size() as u64)
             + if remaining_data_chunk > 0 {
                 get_unsigned_chunk_bytes_length(remaining_data_chunk)
             } else {
@@ -623,12 +622,10 @@ where
                 debug_assert!(this.chunk_buffer.remaining() == 0);
 
                 // We exhausted the body data, now check if the length is correct
-                if let Err(poll_stream_len_err) =
-                    http_1x_utils::check_for_stream_length_mismatch(
-                        *this.inner_body_bytes_read_so_far as u64,
-                        this.options.stream_length,
-                    )
-                {
+                if let Err(poll_stream_len_err) = http_1x_utils::check_for_stream_length_mismatch(
+                    *this.inner_body_bytes_read_so_far as u64,
+                    this.options.stream_length,
+                ) {
                     return poll_stream_len_err;
                 }
 
@@ -715,11 +712,10 @@ where
                         http_1x_utils::total_rendered_length_of_trailers(Some(&trailer));
                     let expected_length = this.options.total_trailer_length();
                     if expected_length != actual_length {
-                        let err =
-                            Box::new(AwsChunkedBodyError::ReportedTrailerLengthMismatch {
-                                actual: actual_length,
-                                expected: expected_length,
-                            });
+                        let err = Box::new(AwsChunkedBodyError::ReportedTrailerLengthMismatch {
+                            actual: actual_length,
+                            expected: expected_length,
+                        });
                         return Poll::Ready(Some(Err(err)));
                     }
 
@@ -1486,13 +1482,15 @@ mod tests {
 
         #[tokio::test]
         async fn test_poll_frame_with_trailers() {
+            let data = Bytes::from("1234567890123456789012345");
+            let stream_len = data.len() as u64;
             let mut trailers = HeaderMap::new();
             trailers.insert("x-amz-checksum-crc32", HeaderValue::from_static("78DeVw=="));
             let body = TestBodyWithTrailers {
-                data: Some(Bytes::from("1234567890123456789012345")),
+                data: Some(data),
                 trailers: Some(trailers),
             };
-            let options = AwsChunkedBodyOptions::new(4, vec![]).with_chunk_size(10);
+            let options = AwsChunkedBodyOptions::new(stream_len, vec![29]).with_chunk_size(10);
             let mut chunked_body = AwsChunkedBody::new(body, options);
 
             let mut data_frames = Vec::new();
@@ -1525,6 +1523,7 @@ mod tests {
 
             // 65KB of 'a' characters
             let data = "a".repeat(65 * 1024);
+            let stream_len = data.len() as u64;
             let inner_body = SdkBody::from(data);
 
             // `StaticTimeSource` for 20130524T000000Z
@@ -1550,9 +1549,8 @@ mod tests {
                 SigningSettings::default(),
             );
 
-            let mut chunked_body =
-                AwsChunkedBody::new(inner_body, AwsChunkedBodyOptions::default())
-                    .with_signer(signer);
+            let opt = AwsChunkedBodyOptions::new(stream_len, vec![]);
+            let mut chunked_body = AwsChunkedBody::new(inner_body, opt).with_signer(signer);
 
             let mut data_frames = Vec::new();
             while let Some(frame) = chunked_body.frame().await.transpose().unwrap() {
@@ -1580,6 +1578,7 @@ mod tests {
 
             // 65KB of 'a' characters
             let data = "a".repeat(65 * 1024);
+            let stream_len = data.len() as u64;
 
             // Set trailers with x-amz-checksum-crc32c header
             let mut trailers = HeaderMap::new();
@@ -1616,9 +1615,8 @@ mod tests {
                 SigningSettings::default(),
             );
 
-            let mut chunked_body =
-                AwsChunkedBody::new(inner_body, AwsChunkedBodyOptions::default())
-                    .with_signer(signer);
+            let opt = AwsChunkedBodyOptions::new(stream_len, vec![30, 88]);
+            let mut chunked_body = AwsChunkedBody::new(inner_body, opt).with_signer(signer);
 
             let mut data_frames = Vec::new();
             while let Some(frame) = chunked_body.frame().await.transpose().unwrap() {
