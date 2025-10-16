@@ -581,6 +581,7 @@ where
                             let signer = this.signer.as_deref_mut().expect("signer must be set");
                             http_1x_utils::signed_encoded_chunk(signer, chunk_bytes).unwrap()
                         };
+                        *this.inner_body_bytes_read_so_far += chunk_size;
                         return Poll::Ready(Some(Ok(http_body_1x::Frame::data(chunk))));
                     }
 
@@ -607,11 +608,21 @@ where
                         let signer = this.signer.as_deref_mut().expect("signer must be set");
                         http_1x_utils::signed_encoded_chunk(signer, chunk_bytes).unwrap()
                     };
-
+                    *this.inner_body_bytes_read_so_far += bytes_len_to_read;
                     return Poll::Ready(Some(Ok(http_body_1x::Frame::data(chunk))));
                 }
 
                 debug_assert!(this.chunk_buffer.remaining() == 0);
+
+                // We exhausted the body data, now check if the length is correct
+                if let Err(poll_stream_len_err) =
+                    http_1x_utils::check_for_stream_length_mismatch(
+                        *this.inner_body_bytes_read_so_far as u64,
+                        this.options.stream_length,
+                    )
+                {
+                    return poll_stream_len_err;
+                }
 
                 if *this.unsigned {
                     *this.state = PollingTrailers;
@@ -691,6 +702,19 @@ where
                         );
                         trailer
                     };
+
+                    let actual_length: u64 =
+                        http_1x_utils::total_rendered_length_of_trailers(Some(&trailer));
+                    let expected_length = this.options.total_trailer_length();
+                    if expected_length != actual_length {
+                        let err =
+                            Box::new(AwsChunkedBodyError::ReportedTrailerLengthMismatch {
+                                actual: actual_length,
+                                expected: expected_length,
+                            });
+                        return Poll::Ready(Some(Err(err)));
+                    }
+
                     trailer_bytes =
                         http_1x_utils::trailers_as_aws_chunked_bytes(Some(&trailer), trailer_bytes);
                     trailer_bytes.freeze()

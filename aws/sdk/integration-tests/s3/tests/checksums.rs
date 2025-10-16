@@ -740,7 +740,7 @@ fn extract_checksum_value<'a, 'b>(input: &'a str, checksum_name: &'b str) -> Opt
 ///       we end up throwing an error :696
 #[tokio::test]
 #[traced_test]
-//#[should_panic(expected = "StreamLengthMismatch { actual: 13, expected: 15 }")]
+#[should_panic(expected = "StreamLengthMismatch { actual: 13, expected: 15 }")]
 async fn test_checksum_reuse_on_retry_streaming_content_len_differs() {
     run_checksum_reuse_streaming_request_test(
         "initial content",
