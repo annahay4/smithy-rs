@@ -7,6 +7,7 @@ package software.amazon.smithy.rustsdk
 
 import software.amazon.smithy.aws.traits.HttpChecksumTrait
 import software.amazon.smithy.model.shapes.OperationShape
+import software.amazon.smithy.model.shapes.StructureShape
 import software.amazon.smithy.model.traits.HttpHeaderTrait
 import software.amazon.smithy.rust.codegen.client.smithy.ClientCodegenContext
 import software.amazon.smithy.rust.codegen.client.smithy.customize.ClientCodegenDecorator
@@ -19,10 +20,12 @@ import software.amazon.smithy.rust.codegen.core.rustlang.writable
 import software.amazon.smithy.rust.codegen.core.smithy.RuntimeConfig
 import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
 import software.amazon.smithy.rust.codegen.core.util.getTrait
+import software.amazon.smithy.rust.codegen.core.util.hasStreamingMember
 
 class AwsChunkedContentEncodingDecorator : ClientCodegenDecorator {
     override val name: String = "AwsChunkedContentEncoding"
-    override val order: Byte = 0
+    // This decorator must decorate after HttpRequestChecksumDecorator so that AwsChunkedBody wraps ChencksumBody
+    override val order: Byte = (HttpRequestChecksumDecorator.ORDER - 1).toByte()
 
     override fun operationCustomizations(
         codegenContext: ClientCodegenContext,
@@ -35,6 +38,7 @@ private class AwsChunkedOparationCustomization(
     private val codegenContext: ClientCodegenContext,
     private val operation: OperationShape,
 ) : OperationCustomization() {
+    private val model = codegenContext.model
     private val runtimeConfig = codegenContext.runtimeConfig
 
     override fun section(section: OperationSection) =
@@ -46,12 +50,16 @@ private class AwsChunkedOparationCustomization(
                         checksumTrait.requestAlgorithmMemberShape(codegenContext, operation) ?: return@writable
                     val requestAlgoHeader =
                         requestAlgorithmMember.getTrait<HttpHeaderTrait>()?.value ?: return@writable
+                    val input = model.expectShape(operation.inputShape, StructureShape::class.java)
+                    if (!input.hasStreamingMember(model)) {
+                        return@writable
+                    }
 
                     section.registerInterceptor(runtimeConfig, this) {
                         val runtimeApi = RuntimeType.smithyRuntimeApiClient(runtimeConfig)
                         rustTemplate(
                             """
-                            #{AwsChunkedContentEncodingInterceptor}::new()
+                            #{AwsChunkedContentEncodingInterceptor}::new(true)
                             """,
                             "AwsChunkedContentEncodingInterceptor" to
                                 runtimeConfig.awsChunked()

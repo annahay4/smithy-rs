@@ -161,6 +161,26 @@ impl AwsChunkedBodyOptions {
         self.trailer_lengths.push(trailer_len);
         self
     }
+
+    pub fn encoded_length(&self) -> u64 {
+        let mut length = 0;
+        if self.stream_length != 0 {
+            length += get_unsigned_chunk_bytes_length(self.stream_length);
+        }
+
+        // End chunk
+        length += CHUNK_TERMINATOR.len() as u64;
+
+        // Trailers
+        for len in self.trailer_lengths.iter() {
+            length += len + CRLF.len() as u64;
+        }
+
+        // Encoding terminator
+        length += CRLF.len() as u64;
+
+        length
+    }
 }
 
 #[derive(Debug)]
@@ -349,26 +369,6 @@ impl<Inner> AwsChunkedBody<Inner> {
             Poll::Ready(Some(Err(_))) => Poll::Ready(false), // break
         }
     }
-
-    fn encoded_length(&self) -> u64 {
-        let mut length = 0;
-        if self.options.stream_length != 0 {
-            length += get_unsigned_chunk_bytes_length(self.options.stream_length);
-        }
-
-        // End chunk
-        length += CHUNK_TERMINATOR.len() as u64;
-
-        // Trailers
-        for len in self.options.trailer_lengths.iter() {
-            length += len + CRLF.len() as u64;
-        }
-
-        // Encoding terminator
-        length += CRLF.len() as u64;
-
-        length
-    }
 }
 
 impl<Inner> http_body_04x::Body for AwsChunkedBody<Inner>
@@ -475,7 +475,7 @@ where
     }
 
     fn size_hint(&self) -> http_body_04x::SizeHint {
-        http_body_04x::SizeHint::with_exact(self.encoded_length())
+        http_body_04x::SizeHint::with_exact(self.options.encoded_length())
     }
 }
 
@@ -556,7 +556,8 @@ where
     }
 
     fn size_hint(&self) -> http_body_1x::SizeHint {
-        http_body_1x::SizeHint::with_exact(self.encoded_length())
+        // Handle the case for encoded_length for signed chunks
+        http_body_1x::SizeHint::with_exact(self.options.encoded_length())
     }
 
     fn poll_frame(

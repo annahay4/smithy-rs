@@ -13,7 +13,7 @@ use aws_sdk_s3::{Client, Config};
 use aws_smithy_runtime::{assert_str_contains, test_util::capture_test_logs::capture_test_logs};
 use aws_smithy_types::body::SdkBody;
 use bytes::{Bytes, BytesMut};
-use http_body_1x::Body;
+use http_body_1x::{Body, SizeHint};
 use std::error::Error;
 use std::time::Duration;
 use std::{future::Future, task::Poll};
@@ -74,6 +74,11 @@ impl Body for SlowBody {
             }
         }
     }
+
+    fn size_hint(&self) -> SizeHint {
+        // The size of b"data_data_..." above is 160 bytes.
+        SizeHint::with_exact(160)
+    }
 }
 
 #[tokio::test]
@@ -89,9 +94,6 @@ async fn test_stalled_stream_protection_defaults_for_upload() {
         .credentials_provider(Credentials::for_tests())
         .region(Region::new("us-east-1"))
         .endpoint_url(format!("http://{server_addr}"))
-        // The Body used here is odd and fails the body.size_hint().exact() check in the streaming branch of
-        // the `RequestChecksumInterceptor`
-        .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
         .build();
     let client = Client::from_conf(conf);
 
