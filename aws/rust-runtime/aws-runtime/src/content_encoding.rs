@@ -162,11 +162,19 @@ impl AwsChunkedBodyOptions {
         self
     }
 
-    pub fn encoded_length(&self) -> u64 {
+        pub fn encoded_length(&self) -> u64 {
         let mut length = 0;
-        if self.stream_length != 0 {
-            length += get_unsigned_chunk_bytes_length(self.stream_length);
-        }
+
+        let number_of_data_chunks = self.stream_length / self.chunk_size() as u64;
+        let remaining_data_chunk = self.stream_length % self.chunk_size() as u64;
+
+        length = number_of_data_chunks
+            * get_unsigned_chunk_bytes_length(self.chunk_size() as u64)
+            + if remaining_data_chunk > 0 {
+                get_unsigned_chunk_bytes_length(remaining_data_chunk)
+            } else {
+                0
+            };
 
         // End chunk
         length += CHUNK_TERMINATOR.len() as u64;
