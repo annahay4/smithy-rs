@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_sigv4::http_request::SigningError;
+use aws_credential_types::credential_fn;
+use aws_sigv4::http_request::{PayloadChecksumKind, SigningError};
 use aws_smithy_runtime_api::http::Headers;
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
 use bytes::{Buf, Bytes, BytesMut};
@@ -17,6 +18,7 @@ use std::task::{Context, Poll};
 const CRLF: &str = "\r\n";
 const CRLF_RAW: &[u8] = b"\r\n";
 
+const CHUNK_SIGNATURE_BEGIN: &str = ";chunk-signature=";
 const CHUNK_SIGNATURE_BEGIN_RAW: &[u8] = b";chunk-signature=";
 
 const CHUNK_TERMINATOR: &str = "0\r\n";
@@ -26,16 +28,18 @@ const TRAILER_SEPARATOR: &[u8] = b":";
 
 const DEFAULT_CHUNK_SIZE_BYTE: usize = 64 * 1024; // 64 KB
 
+const SIGNATURE_LENGTH: usize = 64;
+
 /// Content encoding header value constants
 pub mod header_value {
     /// Header value denoting "aws-chunked" encoding
     pub const AWS_CHUNKED: &str = "aws-chunked";
 }
 
-pub trait SignChunk: std::fmt::Debug {
-    fn sign(&mut self, chunk: &Bytes) -> Result<String, SigningError>;
+pub(crate) trait SignChunk: std::fmt::Debug {
+    fn chunk_signature(&mut self, chunk: &Bytes) -> Result<String, SigningError>;
 
-    fn sign_trailers(&mut self, trailers: &Headers) -> Result<String, SigningError>;
+    fn trailer_signature(&mut self, trailing_headers: &Headers) -> Result<String, SigningError>;
 }
 
 #[derive(Debug)]
@@ -53,8 +57,7 @@ pub struct DeferredSignerSender {
     tx: Mutex<mpsc::Sender<Box<dyn SignChunk + Send + Sync>>>,
 }
 impl DeferredSignerSender {
-    /// Sends a signer on the channel
-    pub fn send(
+    pub(crate) fn send(
         &self,
         signer: Box<dyn SignChunk + Send + Sync>,
     ) -> Result<(), mpsc::SendError<Box<dyn SignChunk + Send + Sync>>> {
@@ -74,6 +77,7 @@ impl DeferredSigner {
         )
     }
 
+    /// Create an empty `DeferredSigner`, typically used as a placeholder for `std::mem::replace`
     pub fn empty() -> Self {
         Self {
             rx: None,
@@ -105,12 +109,12 @@ impl Storable for DeferredSignerSender {
 }
 
 impl SignChunk for DeferredSigner {
-    fn sign(&mut self, chunk: &Bytes) -> Result<String, SigningError> {
-        self.acquire().sign(chunk)
+    fn chunk_signature(&mut self, chunk: &Bytes) -> Result<String, SigningError> {
+        self.acquire().chunk_signature(chunk)
     }
 
-    fn sign_trailers(&mut self, trailers: &Headers) -> Result<String, SigningError> {
-        self.acquire().sign_trailers(trailers)
+    fn trailer_signature(&mut self, trailing_headers: &Headers) -> Result<String, SigningError> {
+        self.acquire().trailer_signature(trailing_headers)
     }
 }
 
@@ -125,7 +129,7 @@ pub struct AwsChunkedBodyOptions {
     /// The length of each trailer sent within an `AwsChunkedBody`. Necessary in
     /// order to correctly calculate the total size of the body accurately.
     trailer_lengths: Vec<u64>,
-    /// The size of each chunk in bytes. Defaults to DEFAULT_CHUNK_SIZE_BYTE if not set.
+    /// The size of each chunk in bytes, only for testing.
     chunk_size: Option<usize>,
 }
 
@@ -139,7 +143,7 @@ impl AwsChunkedBodyOptions {
         }
     }
 
-    /// Set the chunk size for the body.
+    #[allow(dead_code)] // for testing
     fn with_chunk_size(mut self, chunk_size: usize) -> Self {
         self.chunk_size = Some(chunk_size);
         self
@@ -160,6 +164,36 @@ impl AwsChunkedBodyOptions {
     pub fn with_trailer_len(mut self, trailer_len: u64) -> Self {
         self.trailer_lengths.push(trailer_len);
         self
+    }
+
+    pub fn signed_encoded_length(&self) -> u64 {
+        let mut length = 0;
+
+        let number_of_data_chunks = self.stream_length / self.chunk_size() as u64;
+        let remaining_data_chunk = self.stream_length % self.chunk_size() as u64;
+
+        length = number_of_data_chunks * get_signed_chunk_bytes_length(self.chunk_size() as u64)
+            + if remaining_data_chunk > 0 {
+                get_signed_chunk_bytes_length(remaining_data_chunk)
+            } else {
+                0
+            };
+
+        // End chunk
+        length += get_signed_chunk_bytes_length(0);
+        if !self.trailer_lengths.is_empty() {
+            length -= CRLF.len() as u64; // The last CRLF is not needed if there are trailers
+        }
+
+        // Trailers
+        for len in self.trailer_lengths.iter() {
+            length += len + CRLF.len() as u64;
+        }
+
+        // Encoding terminator
+        length += CRLF.len() as u64;
+
+        length
     }
 
     pub fn encoded_length(&self) -> u64 {
@@ -224,25 +258,6 @@ impl ChunkBuf {
             ChunkBuf::Partial(segmented) => segmented,
             ChunkBuf::EosPartial(segmented) => segmented,
             ChunkBuf::Terminated => panic!("buffer has been terminated; this is a bug"),
-        }
-    }
-
-    /// Returns a new `ChunkBuf` with additional data buffered. This will only allocate
-    /// if the `ChunkBuf` was previously empty.
-    fn with_partial(self, partial: Bytes) -> Self {
-        match self {
-            ChunkBuf::Empty => {
-                let mut segmented = SegmentedBuf::new();
-                segmented.push(partial);
-                ChunkBuf::Partial(segmented)
-            }
-            ChunkBuf::Partial(mut segmented) => {
-                segmented.push(partial);
-                ChunkBuf::Partial(segmented)
-            }
-            ChunkBuf::EosPartial(_) | ChunkBuf::Terminated => {
-                panic!("cannot buffer more data after the stream has ended or been terminated; this is a bug")
-            }
         }
     }
 
@@ -312,7 +327,6 @@ pin_project! {
         buffered_trailer: Option<http_1x::HeaderMap>,
         #[pin]
         signer: Option<Box<dyn SignChunk + Send + Sync>>,
-        unsigned: bool,
     }
 }
 
@@ -327,7 +341,6 @@ impl<Inner> AwsChunkedBody<Inner> {
             chunk_buffer: ChunkBuf::Empty,
             buffered_trailer: None,
             signer: None,
-            unsigned: true,
         }
     }
 
@@ -337,17 +350,21 @@ impl<Inner> AwsChunkedBody<Inner> {
     where
         S: SignChunk + Send + Sync + 'static,
     {
-        self.unsigned = false;
         self.signer = Some(Box::new(signer));
         self
     }
 
+    // Buffers the next chunk from the inner body into the provided `chunk_buffer`, and returns
+    // whether or not it should continue reading from `inner`.
+    //
+    // If it has exhausted data frames and started polling trailers, the buffered trailer will be
+    // pushed into `buffered_trailer`, immediately marking the `chunk_buffer` as `eos`.
     fn buffer_next_chunk(
         inner: Pin<&mut Inner>,
         mut chunk_buffer: Pin<&mut ChunkBuf>,
         mut buffered_trailer: Pin<&mut Option<http_1x::HeaderMap>>,
         cx: &mut Context<'_>,
-    ) -> Poll<bool>
+    ) -> Poll<Result<bool, aws_smithy_types::body::Error>>
     where
         Inner: http_body_1x::Body<Data = Bytes, Error = aws_smithy_types::body::Error>,
     {
@@ -362,18 +379,24 @@ impl<Inner> AwsChunkedBody<Inner> {
                             *chunk_buffer.as_mut().get_mut() = ChunkBuf::Partial(buf);
                         }
                         ChunkBuf::Partial(buf) => buf.push(data),
-                        _ => {}
+                        ChunkBuf::EosPartial(_) | ChunkBuf::Terminated => {
+                            panic!("cannot buffer more data after the stream has ended or been terminated; this is a bug")
+                        }
                     }
+                    Poll::Ready(Ok(true))
                 } else {
                     let buf = chunk_buffer.as_mut().get_mut();
                     *buf = std::mem::replace(buf, ChunkBuf::Empty).ended();
                     *buffered_trailer.as_mut().get_mut() = frame.into_trailers().ok();
+                    Poll::Ready(Ok(false))
                 }
-                Poll::Ready(true) // continue
             }
-            Poll::Ready(None) => Poll::Ready(false), // break
+            Poll::Ready(Some(Err(e))) => {
+                *chunk_buffer.as_mut().get_mut() = ChunkBuf::Terminated;
+                Poll::Ready(Err(e))
+            }
+            Poll::Ready(None) => Poll::Ready(Ok(false)),
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Err(_))) => Poll::Ready(false), // break
         }
     }
 }
@@ -563,8 +586,11 @@ where
     }
 
     fn size_hint(&self) -> http_body_1x::SizeHint {
-        // Handle the case for encoded_length for signed chunks
-        http_body_1x::SizeHint::with_exact(self.options.encoded_length())
+        if self.signer.is_none() {
+            http_body_1x::SizeHint::with_exact(self.options.encoded_length())
+        } else {
+            http_body_1x::SizeHint::with_exact(self.options.signed_encoded_length())
+        }
     }
 
     fn poll_frame(
@@ -582,13 +608,14 @@ where
                     if this.chunk_buffer.remaining() >= chunk_size {
                         let buf = this.chunk_buffer.buffered();
                         let chunk_bytes = buf.copy_to_bytes(chunk_size);
-                        let chunk = if *this.unsigned {
+                        let chunk = if this.signer.is_none() {
                             http_1x_utils::unsigned_encoded_chunk(chunk_bytes)
                         } else {
                             let signer = this.signer.as_deref_mut().expect("signer must be set");
                             http_1x_utils::signed_encoded_chunk(signer, chunk_bytes).unwrap()
                         };
                         *this.inner_body_bytes_read_so_far += chunk_size;
+                        tracing::trace!("writing chunk data: {:#?}", chunk);
                         return Poll::Ready(Some(Ok(http_body_1x::Frame::data(chunk))));
                     }
 
@@ -598,8 +625,9 @@ where
                         this.buffered_trailer.as_mut(),
                         cx,
                     ) {
-                        Poll::Ready(true) => continue,
-                        Poll::Ready(false) => break,
+                        Poll::Ready(Ok(true)) => continue,
+                        Poll::Ready(Ok(false)) => break,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
                         Poll::Pending => return Poll::Pending,
                     }
                 }
@@ -609,13 +637,14 @@ where
                         std::cmp::min(this.chunk_buffer.remaining(), chunk_size);
                     let buf = this.chunk_buffer.buffered();
                     let chunk_bytes = buf.copy_to_bytes(bytes_len_to_read);
-                    let chunk = if *this.unsigned {
+                    let chunk = if this.signer.is_none() {
                         http_1x_utils::unsigned_encoded_chunk(chunk_bytes)
                     } else {
                         let signer = this.signer.as_deref_mut().expect("signer must be set");
                         http_1x_utils::signed_encoded_chunk(signer, chunk_bytes).unwrap()
                     };
                     *this.inner_body_bytes_read_so_far += bytes_len_to_read;
+                    tracing::trace!("remaining chunk data: {:#?}", chunk);
                     return Poll::Ready(Some(Ok(http_body_1x::Frame::data(chunk))));
                 }
 
@@ -629,7 +658,7 @@ where
                     return poll_stream_len_err;
                 }
 
-                if *this.unsigned {
+                if this.signer.is_none() {
                     *this.state = PollingTrailers;
                 } else {
                     *this.state = WritingZeroSizedSignedChunk;
@@ -645,46 +674,45 @@ where
                     *this.state = PollingTrailers;
                     let mut zero_sized_chunk = BytesMut::from(&zero_sized_chunk[..]);
                     debug_assert!(zero_sized_chunk.ends_with(b"\r\n\r\n"));
+                    // For trailing checksum, we do not want the second CRLF as the checksum is appended after the first CRLF
                     zero_sized_chunk.truncate(zero_sized_chunk.len() - 2);
                     let zero_sized_chunk = zero_sized_chunk.freeze();
-                    return Poll::Ready(Some(Ok(http_body_1x::Frame::data(zero_sized_chunk))));
+                    tracing::trace!("writing zero sized signed chunk: {:#?}", zero_sized_chunk);
+                    Poll::Ready(Some(Ok(http_body_1x::Frame::data(zero_sized_chunk))))
                 } else {
                     *this.state = Closed;
-                    return Poll::Ready(Some(Ok(http_body_1x::Frame::data(zero_sized_chunk))));
+                    tracing::trace!(
+                        "writing zero sized signed chunk without trailer: {:#?}",
+                        zero_sized_chunk
+                    );
+                    Poll::Ready(Some(Ok(http_body_1x::Frame::data(zero_sized_chunk))))
                 }
             }
-            PollingTrailers => {
-                loop {
-                    match this.inner.as_mut().poll_frame(cx) {
-                        Poll::Ready(Some(Ok(frame))) => {
-                            let trailers = frame.into_trailers().ok();
-                            if let Some(trailers) = trailers {
-                                match this.buffered_trailer.as_mut().get_mut() {
-                                    Some(existing) => existing.extend(trailers),
-                                    None => {
-                                        *this.buffered_trailer.as_mut().get_mut() = Some(trailers)
-                                    }
-                                }
-                            }
-                            cx.waker().wake_by_ref();
-                            return Poll::Pending;
+            PollingTrailers => match this.inner.as_mut().poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    let trailers = frame.into_trailers().ok();
+                    if let Some(trailers) = trailers {
+                        match this.buffered_trailer.as_mut().get_mut() {
+                            Some(existing) => existing.extend(trailers),
+                            None => *this.buffered_trailer.as_mut().get_mut() = Some(trailers),
                         }
-                        Poll::Ready(Some(Err(err))) => {
-                            tracing::error!(error = ?err, "error polling inner");
-                            return Poll::Ready(Some(Err(err)));
-                        }
-                        Poll::Ready(None) => {
-                            break;
-                        }
-                        Poll::Pending => return Poll::Pending,
                     }
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
                 }
-                *this.state = WritingTrailers;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
+                Poll::Ready(Some(Err(err))) => {
+                    tracing::error!(error = ?err, "error polling inner");
+                    Poll::Ready(Some(Err(err)))
+                }
+                Poll::Ready(None) => {
+                    *this.state = WritingTrailers;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Poll::Pending => Poll::Pending,
+            },
             WritingTrailers => {
-                let mut final_chunk = if *this.unsigned {
+                let mut final_chunk = if this.signer.is_none() {
                     let mut zero_sized_data = BytesMut::new();
                     zero_sized_data.extend_from_slice(CHUNK_TERMINATOR_RAW);
                     zero_sized_data
@@ -694,12 +722,12 @@ where
 
                 let trailer_bytes = if let Some(mut trailer) = this.buffered_trailer.take() {
                     let mut trailer_bytes = BytesMut::new();
-                    let trailer = if trailer.is_empty() || *this.unsigned {
+                    let trailer = if trailer.is_empty() || this.signer.is_none() {
                         trailer
                     } else {
                         let signer = this.signer.as_deref_mut().expect("signer must be set");
                         let signature = signer
-                            .sign_trailers(&Headers::try_from(trailer.clone()).unwrap())
+                            .trailer_signature(&Headers::try_from(trailer.clone()).unwrap())
                             .unwrap();
                         trailer.insert(
                             http_1x::header::HeaderName::from_static("x-amz-trailer-signature"),
@@ -735,9 +763,11 @@ where
 
                 final_chunk.extend_from_slice(&trailer_bytes);
                 final_chunk.extend_from_slice(CRLF_RAW);
-                return Poll::Ready(Some(Ok(http_body_1x::Frame::data(final_chunk.freeze()))));
+
+                tracing::trace!("final chunk: {:#?}", final_chunk);
+                Poll::Ready(Some(Ok(http_body_1x::Frame::data(final_chunk.freeze()))))
             }
-            Closed => return Poll::Ready(None),
+            Closed => Poll::Ready(None),
         }
     }
 }
@@ -760,7 +790,7 @@ mod http_1x_utils {
         let mut chunk = bytes::BytesMut::new();
         chunk.extend_from_slice(chunk_size.as_bytes());
         chunk.extend_from_slice(CHUNK_SIGNATURE_BEGIN_RAW);
-        chunk.extend_from_slice(signer.sign(&chunk_bytes)?.as_bytes());
+        chunk.extend_from_slice(signer.chunk_signature(&chunk_bytes)?.as_bytes());
         chunk.extend_from_slice(CRLF_RAW);
         chunk.extend_from_slice(&chunk_bytes);
         chunk.extend_from_slice(CRLF_RAW);
@@ -889,12 +919,26 @@ where
     let zero = T::from(0);
     let sixteen = T::from(16);
 
+    if i == zero {
+        return 1;
+    }
+
     while i > zero {
         i /= sixteen;
         len += 1;
     }
 
     len
+}
+
+fn get_signed_chunk_bytes_length(payload_length: u64) -> u64 {
+    let hex_repr_len = int_log16(payload_length);
+    hex_repr_len
+        + CHUNK_SIGNATURE_BEGIN.len() as u64
+        + SIGNATURE_LENGTH as u64
+        + CRLF.len() as u64
+        + payload_length
+        + CRLF.len() as u64
 }
 
 fn get_unsigned_chunk_bytes_length(payload_length: u64) -> u64 {
@@ -904,6 +948,24 @@ fn get_unsigned_chunk_bytes_length(payload_length: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::int_log16;
+
+    #[test]
+    fn test_int_log16() {
+        assert_eq!(int_log16(0u64), 1); // 0x0
+        assert_eq!(int_log16(1u64), 1); // 0x1
+        assert_eq!(int_log16(15u64), 1); // 0xF
+        assert_eq!(int_log16(16u64), 2); // 0x10
+        assert_eq!(int_log16(255u64), 2); // 0xFF
+        assert_eq!(int_log16(256u64), 3); // 0x100
+        assert_eq!(int_log16(4095u64), 3); // 0xFFF
+        assert_eq!(int_log16(4096u64), 4); // 0x1000
+        assert_eq!(int_log16(65535u64), 4); // 0xFFFF
+        assert_eq!(int_log16(65536u64), 5); // 0x10000
+        assert_eq!(int_log16(1048575u64), 5); // 0xFFFFF
+        assert_eq!(int_log16(1048576u64), 6); // 0x100000
+        assert_eq!(int_log16(u64::MAX), 16); // 0xFFFFFFFFFFFFFFFF
+    }
 
     #[cfg(test)]
     mod http_02x_tests {
@@ -1174,6 +1236,8 @@ mod tests {
 
     #[cfg(test)]
     mod http_1x_tests {
+        use crate::content_encoding::DEFAULT_CHUNK_SIZE_BYTE;
+
         use super::super::{
             http_1x_utils::{total_rendered_length_of_trailers, trailers_as_aws_chunked_bytes},
             AwsChunkedBody, AwsChunkedBodyOptions, CHUNK_TERMINATOR_RAW, CRLF_RAW,
@@ -1630,6 +1694,25 @@ mod tests {
             assert!(data_frames[1].starts_with(b"400;chunk-signature=1c1344b170168f8e65b41376b44b20fe354e373826ccbbe2c1d40a8cae51e5c7\r\n"));
             assert_eq!(data_frames[2], Bytes::from_static(b"0;chunk-signature=2ca2aba2005185cf7159c6277faf83795951dd77a3a99e6e65d5c9f85863f992\r\n"));
             assert_eq!(data_frames[3], Bytes::from_static(b"x-amz-checksum-crc32c:sOO8/Q==\r\nx-amz-trailer-signature:d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca17fe2e435\r\n\r\n"));
+        }
+
+        #[test]
+        fn test_signed_encoded_length_with_no_trailer() {
+            {
+                let options = AwsChunkedBodyOptions::new(10, vec![]);
+                assert_eq!(options.signed_encoded_length(), 184);
+            }
+            {
+                let options =
+                    AwsChunkedBodyOptions::new((DEFAULT_CHUNK_SIZE_BYTE + 10) as u64, vec![]);
+                assert_eq!(options.signed_encoded_length(), 65810);
+            }
+        }
+
+        #[test]
+        fn test_signed_encoded_length_with_trailer() {
+            let options = AwsChunkedBodyOptions::new(10, vec![30, 88]);
+            assert_eq!(options.signed_encoded_length(), 304);
         }
     }
 }

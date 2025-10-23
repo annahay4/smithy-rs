@@ -3,13 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::{date_time::{format_date, format_date_time}, http_request::SigningError, SigningOutput};
+use crate::{
+    date_time::{format_date, format_date_time},
+    http_request::SigningError,
+    SigningOutput,
+};
 use aws_credential_types::Credentials;
 use aws_smithy_runtime_api::{client::identity::Identity, http::Headers};
 use bytes::Bytes;
 use hmac::{digest::FixedOutput, Hmac, Mac};
 use sha2::{Digest, Sha256};
-use std::io::Write;
 use std::time::SystemTime;
 
 /// HashedPayload = Lowercase(HexEncode(Hash(requestPayload)))
@@ -199,33 +202,13 @@ pub fn sign_chunk<'a, S>(
     running_signature: &'a str,
     params: &'a SigningParams<'a, S>,
 ) -> Result<SigningOutput<()>, SigningError> {
-    let creds = params
-        .identity
-        .data::<Credentials>()
-        .expect("identity must contain credentials");
-
-    let signing_key = generate_signing_key(
-        creds.secret_access_key(),
-        params.time,
-        params.region,
-        params.name,
-    );
-
-    let mut string_to_sign: Vec<u8> = Vec::new();
-    write!(
-        string_to_sign,
-        "{algorithm}\n{date_time}\n{scope}\n{signature}\n{non_sig}\n{chunk}",
-        algorithm = "AWS4-HMAC-SHA256-PAYLOAD",
-        date_time = format_date_time(params.time),
-        scope = format!("{}/{}/{}/aws4_request", format_date(params.time), params.region, params.name),
-        signature = running_signature,
-        non_sig = sha256_hex_string([]),
-        chunk = sha256_hex_string(chunk),
-    ).unwrap();
-
-    let signature = calculate_signature(signing_key, &string_to_sign);
-    
-    Ok(SigningOutput::new((), signature))
+    let payload_hash = format!("{}\n{}", sha256_hex_string([]), sha256_hex_string(chunk));
+    sign_streaming_payload(
+        "AWS4-HMAC-SHA256-PAYLOAD",
+        running_signature,
+        params,
+        &payload_hash,
+    )
 }
 
 pub fn sign_trailer_chunk<'a, S>(
@@ -234,8 +217,10 @@ pub fn sign_trailer_chunk<'a, S>(
     params: &'a SigningParams<'a, S>,
 ) -> Result<SigningOutput<()>, SigningError> {
     fn canonical_headers(headers: &Headers) -> Vec<u8> {
+        let mut sorted_headers: Vec<_> = headers.iter().collect();
+        sorted_headers.sort_by_key(|(name, _)| name.to_lowercase());
         let mut buf = Vec::new();
-        for (name, value) in headers.iter() {
+        for (name, value) in sorted_headers.iter() {
             buf.extend_from_slice(name.to_lowercase().as_bytes());
             buf.extend_from_slice(b":");
             buf.extend_from_slice(value.trim().as_bytes());
@@ -244,6 +229,21 @@ pub fn sign_trailer_chunk<'a, S>(
         buf
     }
 
+    let payload_hash = sha256_hex_string(canonical_headers(headers));
+    sign_streaming_payload(
+        "AWS4-HMAC-SHA256-TRAILER",
+        running_signature,
+        params,
+        &payload_hash,
+    )
+}
+
+fn sign_streaming_payload<'a, S>(
+    algorithm: &str,
+    running_signature: &'a str,
+    params: &'a SigningParams<'a, S>,
+    payload_hash: &str,
+) -> Result<SigningOutput<()>, SigningError> {
     let creds = params
         .identity
         .data::<Credentials>()
@@ -256,19 +256,23 @@ pub fn sign_trailer_chunk<'a, S>(
         params.name,
     );
 
-    let mut string_to_sign: Vec<u8> = Vec::new();
-    write!(
-        string_to_sign,
-        "{algorithm}\n{date_time}\n{scope}\n{signature}\n{trailer}",
-        algorithm = "AWS4-HMAC-SHA256-TRAILER",
-        date_time = format_date_time(params.time),
-        scope = format!("{}/{}/{}/aws4_request", format_date(params.time), params.region, params.name),
-        signature = running_signature,
-        trailer = sha256_hex_string(canonical_headers(headers)),
-    ).unwrap();
+    let scope = format!(
+        "{}/{}/{}/aws4_request",
+        format_date(params.time),
+        params.region,
+        params.name
+    );
 
-    let signature = calculate_signature(signing_key, &string_to_sign);
-    
+    let string_to_sign = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        algorithm,
+        format_date_time(params.time),
+        scope,
+        running_signature,
+        payload_hash,
+    );
+
+    let signature = calculate_signature(signing_key, string_to_sign.as_bytes());
     Ok(SigningOutput::new((), signature))
 }
 
