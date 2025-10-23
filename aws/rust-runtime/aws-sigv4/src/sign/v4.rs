@@ -3,7 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::{date_time::{format_date, format_date_time}, http_request::SigningError, SigningOutput};
+use crate::{
+    date_time::{format_date, format_date_time},
+    http_request::SigningError,
+    SigningOutput,
+};
 use aws_credential_types::Credentials;
 use aws_smithy_runtime_api::{client::identity::Identity, http::Headers};
 use bytes::Bytes;
@@ -214,17 +218,22 @@ pub fn sign_chunk<'a, S>(
     let mut string_to_sign: Vec<u8> = Vec::new();
     write!(
         string_to_sign,
-        "{algorithm}\n{date_time}\n{scope}\n{signature}\n{non_sig}\n{chunk}",
-        algorithm = "AWS4-HMAC-SHA256-PAYLOAD",
+        "AWS4-HMAC-SHA256-PAYLOAD\n{date_time}\n{scope}\n{signature}\n{non_sig}\n{chunk}",
         date_time = format_date_time(params.time),
-        scope = format!("{}/{}/{}/aws4_request", format_date(params.time), params.region, params.name),
+        scope = format!(
+            "{}/{}/{}/aws4_request",
+            format_date(params.time),
+            params.region,
+            params.name
+        ),
         signature = running_signature,
         non_sig = sha256_hex_string([]),
         chunk = sha256_hex_string(chunk),
-    ).unwrap();
+    )
+    .unwrap();
 
     let signature = calculate_signature(signing_key, &string_to_sign);
-    
+
     Ok(SigningOutput::new((), signature))
 }
 
@@ -234,8 +243,10 @@ pub fn sign_trailer_chunk<'a, S>(
     params: &'a SigningParams<'a, S>,
 ) -> Result<SigningOutput<()>, SigningError> {
     fn canonical_headers(headers: &Headers) -> Vec<u8> {
+        let mut sorted_headers: Vec<_> = headers.iter().collect();
+        sorted_headers.sort_by_key(|(name, _)| name.to_lowercase());
         let mut buf = Vec::new();
-        for (name, value) in headers.iter() {
+        for (name, value) in sorted_headers.iter() {
             buf.extend_from_slice(name.to_lowercase().as_bytes());
             buf.extend_from_slice(b":");
             buf.extend_from_slice(value.trim().as_bytes());
@@ -259,16 +270,21 @@ pub fn sign_trailer_chunk<'a, S>(
     let mut string_to_sign: Vec<u8> = Vec::new();
     write!(
         string_to_sign,
-        "{algorithm}\n{date_time}\n{scope}\n{signature}\n{trailer}",
-        algorithm = "AWS4-HMAC-SHA256-TRAILER",
+        "AWS4-HMAC-SHA256-TRAILER\n{date_time}\n{scope}\n{signature}\n{trailer}",
         date_time = format_date_time(params.time),
-        scope = format!("{}/{}/{}/aws4_request", format_date(params.time), params.region, params.name),
+        scope = format!(
+            "{}/{}/{}/aws4_request",
+            format_date(params.time),
+            params.region,
+            params.name
+        ),
         signature = running_signature,
         trailer = sha256_hex_string(canonical_headers(headers)),
-    ).unwrap();
+    )
+    .unwrap();
 
     let signature = calculate_signature(signing_key, &string_to_sign);
-    
+
     Ok(SigningOutput::new((), signature))
 }
 

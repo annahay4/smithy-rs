@@ -14,7 +14,7 @@ use aws_sigv4::http_request::{
     sign, SignableBody, SignableRequest, SigningError, SigningParams, SigningSettings,
 };
 use aws_sigv4::sign::v4::{self, sign_chunk, sign_trailer_chunk};
-use aws_smithy_async::time::SharedTimeSource;
+use aws_smithy_async::time::{SharedTimeSource, StaticTimeSource};
 use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::auth::{
     AuthScheme, AuthSchemeEndpointConfig, AuthSchemeId, Sign,
@@ -225,7 +225,7 @@ impl Sign for SigV4Signer {
         .into_parts();
 
         if let Some(signer_sender) = config_bag.load::<DeferredSignerSender>() {
-            let time_source = runtime_components.time_source().unwrap_or_default();
+            let time_source = StaticTimeSource::new(request_time).into();
             let region = operation_config.region.clone().unwrap();
             let name = operation_config.name.clone().unwrap();
             signer_sender
@@ -313,17 +313,17 @@ where
 }
 
 impl SignChunk for SigV4MessageSigner<SigningSettings> {
-    fn sign(&mut self, chunk: &bytes::Bytes) -> Result<String, SigningError> {
+    fn chunk_signature(&mut self, chunk: &Bytes) -> Result<String, SigningError> {
         let params = self.signing_params();
         let (_, signature) = sign_chunk(chunk, &self.running_signature, &params)?.into_parts();
         self.running_signature = signature.clone();
         Ok(signature)
     }
 
-    fn sign_trailers(&mut self, trailers: &Headers) -> Result<String, SigningError> {
+    fn trailer_signature(&mut self, trailing_headers: &Headers) -> Result<String, SigningError> {
         let params = self.signing_params();
         let (_, signature) =
-            sign_trailer_chunk(trailers, &self.running_signature, &params)?.into_parts();
+            sign_trailer_chunk(trailing_headers, &self.running_signature, &params)?.into_parts();
         self.running_signature = signature.clone();
         Ok(signature)
     }
