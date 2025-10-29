@@ -59,7 +59,7 @@ private class AwsChunkedOparationCustomization(
                         val runtimeApi = RuntimeType.smithyRuntimeApiClient(runtimeConfig)
                         rustTemplate(
                             """
-                            #{AwsChunkedContentEncodingInterceptor}::new(true)
+                            #{AwsChunkedContentEncodingInterceptor}
                             """,
                             "AwsChunkedContentEncodingInterceptor" to
                                 runtimeConfig.awsChunked()

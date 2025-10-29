@@ -133,6 +133,10 @@ pub struct AwsChunkedBodyOptions {
     chunk_size: Option<usize>,
 }
 
+impl Storable for AwsChunkedBodyOptions {
+    type Storer = StoreReplace<Self>;
+}
+
 impl AwsChunkedBodyOptions {
     /// Create a new [`AwsChunkedBodyOptions`].
     pub fn new(stream_length: u64, trailer_lengths: Vec<u64>) -> Self {
