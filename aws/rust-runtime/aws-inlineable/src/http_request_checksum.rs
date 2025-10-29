@@ -11,6 +11,8 @@
 use crate::presigning::PresigningMarker;
 use aws_smithy_checksums::body::calculate;
 use aws_smithy_checksums::body::ChecksumCache;
+use aws_smithy_checksums::http::HttpChecksum;
+use aws_smithy_checksums::Checksum;
 use aws_smithy_checksums::ChecksumAlgorithm;
 use aws_smithy_runtime::client::sdk_feature::SmithySdkFeature;
 use aws_smithy_runtime_api::box_error::BoxError;
@@ -23,6 +25,7 @@ use aws_smithy_runtime_api::http::Request;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::checksum_config::RequestChecksumCalculation;
 use aws_smithy_types::config_bag::{ConfigBag, Storable, StoreReplace};
+use http_1x::HeaderMap;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -68,10 +71,8 @@ pub(crate) struct RequestChecksumInterceptorState {
 impl RequestChecksumInterceptorState {
     pub(crate) fn checksum_algorithm(&self) -> Option<ChecksumAlgorithm> {
         self.checksum_algorithm
-            .clone()
-            .map(|s| ChecksumAlgorithm::from_str(s.as_str()))
-            .transpose()
-            .expect("known checksum altorighm")
+            .as_ref()
+            .and_then(|s| ChecksumAlgorithm::from_str(s.as_str()).ok())
     }
 }
 
@@ -238,44 +239,30 @@ where
         let checksum_algorithm = state
             .checksum_algorithm()
             .expect("set in `modify_before_retry_loop`");
-
         let mut checksum = checksum_algorithm.into_impl();
-
-        // If the body is streaming, bail out since body signing won't take place
-        if context.request().body().bytes().is_none() {
-            context.request_mut().headers_mut().insert(
-                http_1x::header::HeaderName::from_static("x-amz-trailer"),
-                checksum.header_name(),
-            );
-
+        if user_set_checksum_value(context.request(), &checksum) {
             return Ok(());
         }
 
-        let request = context.request_mut();
-        let data = request.body().bytes().expect("non-streaming body");
+        match context.request().body().bytes() {
+            Some(data) => {
+                tracing::debug!("applying {checksum_algorithm:?} of the request body as a header");
+                checksum.update(data);
 
-        // If the header has not already been set we set it. If it was already set by the user
-        // we do nothing and maintain their set value.
-        if request.headers().get(checksum.header_name()).is_none() {
-            tracing::debug!("applying {checksum_algorithm:?} of the request body as a header");
-            checksum.update(data);
-            let checksum_cache = state.checksum_cache.clone();
-
-            let calculated_headers = checksum.headers();
-            let checksum_headers = if let Some(cached_headers) = checksum_cache.get() {
-                if cached_headers != calculated_headers {
-                    tracing::warn!(cached = ?cached_headers, calculated = ?calculated_headers, "calculated checksum differs from cached checksum!");
+                for (hdr_name, hdr_value) in
+                    get_or_cache_headers(checksum.headers(), &state.checksum_cache).iter()
+                {
+                    context
+                        .request_mut()
+                        .headers_mut()
+                        .insert(hdr_name.clone(), hdr_value.clone());
                 }
-                cached_headers
-            } else {
-                checksum_cache.set(calculated_headers.clone());
-                calculated_headers
-            };
-
-            for (hdr_name, hdr_value) in checksum_headers.iter() {
-                request
-                    .headers_mut()
-                    .insert(hdr_name.clone(), hdr_value.clone());
+            }
+            None => {
+                context.request_mut().headers_mut().insert(
+                    http_1x::header::HeaderName::from_static("x-amz-trailer"),
+                    checksum.header_name(),
+                );
             }
         }
 
@@ -299,11 +286,13 @@ where
             .load::<RequestChecksumInterceptorState>()
             .expect("set in `read_before_serialization`");
         let checksum_algorithm = state
-            .checksum_algorithm
-            .clone()
-            .map(|s| ChecksumAlgorithm::from_str(s.as_str()))
-            .transpose()?
-            .expect("set in `modify_before_signing`");
+            .checksum_algorithm()
+            .expect("set in `modify_before_retry_loop`");
+        let checksum = checksum_algorithm.into_impl();
+
+        if user_set_checksum_value(request, &checksum) {
+            return Ok(());
+        }
 
         let mut body = {
             let body = mem::replace(request.body_mut(), SdkBody::taken());
@@ -331,6 +320,21 @@ fn incorporate_custom_default(
     match cfg.load::<DefaultRequestChecksumOverride>() {
         Some(checksum_override) => checksum_override.custom_default(checksum, cfg),
         None => checksum,
+    }
+}
+
+fn get_or_cache_headers(
+    calculated_headers: HeaderMap,
+    checksum_cache: &ChecksumCache,
+) -> HeaderMap {
+    if let Some(cached_headers) = checksum_cache.get() {
+        if cached_headers != calculated_headers {
+            tracing::warn!(cached = ?cached_headers, calculated = ?calculated_headers, "calculated checksum differs from cached checksum!");
+        }
+        cached_headers
+    } else {
+        checksum_cache.set(calculated_headers.clone());
+        calculated_headers
     }
 }
 
@@ -400,6 +404,13 @@ fn track_metric_for_selected_checksum_algorithm(
                 more_info = "Unsupported value of ChecksumAlgorithm detected when setting user-agent metrics",
                 unsupported = ?unsupported),
     }
+}
+
+fn user_set_checksum_value(request: &Request, checksum: impl AsRef<dyn HttpChecksum>) -> bool {
+    request
+        .headers()
+        .get(checksum.as_ref().header_name())
+        .is_some()
 }
 
 /*
