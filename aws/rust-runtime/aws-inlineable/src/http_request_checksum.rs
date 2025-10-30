@@ -12,7 +12,6 @@ use crate::presigning::PresigningMarker;
 use aws_smithy_checksums::body::calculate;
 use aws_smithy_checksums::body::ChecksumCache;
 use aws_smithy_checksums::http::HttpChecksum;
-use aws_smithy_checksums::Checksum;
 use aws_smithy_checksums::ChecksumAlgorithm;
 use aws_smithy_runtime::client::sdk_feature::SmithySdkFeature;
 use aws_smithy_runtime_api::box_error::BoxError;
@@ -66,6 +65,7 @@ pub(crate) struct RequestChecksumInterceptorState {
     request_checksum_required: bool,
     calculate_checksum: Arc<AtomicBool>,
     checksum_cache: ChecksumCache,
+    user_set_checksum_value: Option<bool>,
 }
 
 impl RequestChecksumInterceptorState {
@@ -163,6 +163,7 @@ where
                 request_checksum_required,
                 checksum_cache: ChecksumCache::new(),
                 calculate_checksum: Arc::new(AtomicBool::new(false)),
+                user_set_checksum_value: None,
             });
 
         Ok(())
@@ -177,21 +178,17 @@ where
     ) -> Result<(), BoxError> {
         let user_set_checksum_value = (self.checksum_mutator)(context.request_mut(), cfg)
             .expect("Checksum header mutation should not fail");
-        // If the user manually set a checksum header we short circuit
-        if user_set_checksum_value {
-            return Ok(());
-        }
-
-        // Need to know if this is a presigned req because we do not calculate checksums for those.
-        if cfg.load::<PresigningMarker>().is_some() {
-            // Presigning, no need to apply request checksum
-            return Ok(());
-        }
+        let is_presigned = cfg.load::<PresigningMarker>().is_some();
 
         let state = cfg
             .get_mut_from_interceptor_state::<RequestChecksumInterceptorState>()
             .expect("set in `read_before_serialization`");
-        let mut state = std::mem::take(state);
+        state.user_set_checksum_value = Some(user_set_checksum_value);
+
+        // If the user manually set a checksum header or if this is a presigned request, we short circuit
+        if user_set_checksum_value || is_presigned {
+            return Ok(());
+        }
 
         // If the algorithm fails to parse it is not one we support and we error
         let checksum_algorithm = state
@@ -199,6 +196,8 @@ where
             .clone()
             .map(|s| ChecksumAlgorithm::from_str(s.as_str()))
             .transpose()?;
+
+        let mut state = std::mem::take(state);
 
         if calculate_checksum(cfg, &state) {
             state.calculate_checksum.store(true, Ordering::Release);
@@ -232,7 +231,7 @@ where
             .expect("set in `read_before_serialization`");
 
         let calculate_checksum = state.calculate_checksum.load(Ordering::SeqCst);
-        if !calculate_checksum {
+        if !calculate_checksum || state.user_set_checksum_value.unwrap_or_default() {
             return Ok(());
         }
 
@@ -240,9 +239,6 @@ where
             .checksum_algorithm()
             .expect("set in `modify_before_retry_loop`");
         let mut checksum = checksum_algorithm.into_impl();
-        if user_set_checksum_value(context.request(), &checksum) {
-            return Ok(());
-        }
 
         match context.request().body().bytes() {
             Some(data) => {
@@ -275,8 +271,7 @@ where
         _runtime_components: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
-        let request = ctx.request_mut();
-        if request.body().bytes().is_some() {
+        if ctx.request().body().bytes().is_some() {
             // Nothing to do for non-streaming bodies since the checksum was added to the the header
             // in `modify_before_signing` and signing has already been done by the time this hook is called.
             return Ok(());
@@ -285,17 +280,20 @@ where
         let state = cfg
             .load::<RequestChecksumInterceptorState>()
             .expect("set in `read_before_serialization`");
-        let checksum_algorithm = state
-            .checksum_algorithm()
-            .expect("set in `modify_before_retry_loop`");
-        let checksum = checksum_algorithm.into_impl();
 
-        if user_set_checksum_value(request, &checksum) {
+        let calculate_checksum = state.calculate_checksum.load(Ordering::SeqCst);
+        if !calculate_checksum || state.user_set_checksum_value.unwrap_or_default() {
             return Ok(());
         }
 
+        let request = ctx.request_mut();
+
         let mut body = {
             let body = mem::replace(request.body_mut(), SdkBody::taken());
+
+            let checksum_algorithm = state
+                .checksum_algorithm()
+                .expect("set in `modify_before_retry_loop`");
             let checksum_cache = state.checksum_cache.clone();
 
             body.map(move |body| {
@@ -404,13 +402,6 @@ fn track_metric_for_selected_checksum_algorithm(
                 more_info = "Unsupported value of ChecksumAlgorithm detected when setting user-agent metrics",
                 unsupported = ?unsupported),
     }
-}
-
-fn user_set_checksum_value(request: &Request, checksum: impl AsRef<dyn HttpChecksum>) -> bool {
-    request
-        .headers()
-        .get(checksum.as_ref().header_name())
-        .is_some()
 }
 
 /*
