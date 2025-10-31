@@ -727,12 +727,10 @@ where
                 Poll::Pending => Poll::Pending,
             },
             WritingTrailers => {
-                let mut final_chunk = if !this.options.is_signed {
-                    let mut zero_sized_data = BytesMut::new();
-                    zero_sized_data.extend_from_slice(CHUNK_TERMINATOR_RAW);
-                    zero_sized_data
-                } else {
+                let mut final_chunk = if this.options.is_signed {
                     BytesMut::new()
+                } else {
+                    BytesMut::from(CHUNK_TERMINATOR_RAW)
                 };
 
                 let trailer_bytes = if let Some(mut trailer) = this.buffered_trailer.take() {
