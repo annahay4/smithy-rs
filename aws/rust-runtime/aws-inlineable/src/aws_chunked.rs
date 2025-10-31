@@ -46,11 +46,14 @@ impl Intercept for AwsChunkedContentEncodingInterceptor {
         _runtime_components: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
-        if cfg.load::<PresigningMarker>().is_some() {
+        if context.request().body().bytes().is_some() {
             return Ok(());
         }
 
-        if context.request().body().bytes().is_some() {
+        let state = cfg
+            .load::<crate::http_request_checksum::RequestChecksumInterceptorState>()
+            .expect("state set");
+        if !state.calculate_checksum() {
             return Ok(());
         }
 
@@ -67,10 +70,6 @@ impl Intercept for AwsChunkedContentEncodingInterceptor {
                 crate::http_request_checksum::Error::UnsizedRequestBody,
             ))?;
         };
-
-        let state = cfg
-            .load::<crate::http_request_checksum::RequestChecksumInterceptorState>()
-            .expect("state set");
 
         let sign_during_aws_chunked_encoding = context.request().uri().starts_with("http:");
         let chunked_boty_options = create_chunked_body_options(
@@ -115,12 +114,13 @@ impl Intercept for AwsChunkedContentEncodingInterceptor {
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         if ctx.request().body().bytes().is_some() {
-            // Not a streaming body, no need to apply aws-chunked encoding
             return Ok(());
         }
 
-        if cfg.load::<PresigningMarker>().is_some() {
-            // Presigning, no need to apply aws-chunked encoding
+        let state = cfg
+            .load::<crate::http_request_checksum::RequestChecksumInterceptorState>()
+            .expect("state set");
+        if !state.calculate_checksum() {
             return Ok(());
         }
 

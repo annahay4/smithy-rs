@@ -11,7 +11,6 @@
 use crate::presigning::PresigningMarker;
 use aws_smithy_checksums::body::calculate;
 use aws_smithy_checksums::body::ChecksumCache;
-use aws_smithy_checksums::http::HttpChecksum;
 use aws_smithy_checksums::ChecksumAlgorithm;
 use aws_smithy_runtime::client::sdk_feature::SmithySdkFeature;
 use aws_smithy_runtime_api::box_error::BoxError;
@@ -65,7 +64,6 @@ pub(crate) struct RequestChecksumInterceptorState {
     request_checksum_required: bool,
     calculate_checksum: Arc<AtomicBool>,
     checksum_cache: ChecksumCache,
-    user_set_checksum_value: Option<bool>,
 }
 
 impl RequestChecksumInterceptorState {
@@ -73,6 +71,10 @@ impl RequestChecksumInterceptorState {
         self.checksum_algorithm
             .as_ref()
             .and_then(|s| ChecksumAlgorithm::from_str(s.as_str()).ok())
+    }
+
+    pub(crate) fn calculate_checksum(&self) -> bool {
+        self.calculate_checksum.load(Ordering::SeqCst)
     }
 }
 
@@ -163,7 +165,6 @@ where
                 request_checksum_required,
                 checksum_cache: ChecksumCache::new(),
                 calculate_checksum: Arc::new(AtomicBool::new(false)),
-                user_set_checksum_value: None,
             });
 
         Ok(())
@@ -180,15 +181,14 @@ where
             .expect("Checksum header mutation should not fail");
         let is_presigned = cfg.load::<PresigningMarker>().is_some();
 
-        let state = cfg
-            .get_mut_from_interceptor_state::<RequestChecksumInterceptorState>()
-            .expect("set in `read_before_serialization`");
-        state.user_set_checksum_value = Some(user_set_checksum_value);
-
         // If the user manually set a checksum header or if this is a presigned request, we short circuit
         if user_set_checksum_value || is_presigned {
             return Ok(());
         }
+
+        let state = cfg
+            .get_mut_from_interceptor_state::<RequestChecksumInterceptorState>()
+            .expect("set in `read_before_serialization`");
 
         // If the algorithm fails to parse it is not one we support and we error
         let checksum_algorithm = state
@@ -230,8 +230,7 @@ where
             .load::<RequestChecksumInterceptorState>()
             .expect("set in `read_before_serialization`");
 
-        let calculate_checksum = state.calculate_checksum.load(Ordering::SeqCst);
-        if !calculate_checksum || state.user_set_checksum_value.unwrap_or_default() {
+        if !state.calculate_checksum() {
             return Ok(());
         }
 
@@ -281,8 +280,7 @@ where
             .load::<RequestChecksumInterceptorState>()
             .expect("set in `read_before_serialization`");
 
-        let calculate_checksum = state.calculate_checksum.load(Ordering::SeqCst);
-        if !calculate_checksum || state.user_set_checksum_value.unwrap_or_default() {
+        if !state.calculate_checksum() {
             return Ok(());
         }
 
