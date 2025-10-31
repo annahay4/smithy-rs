@@ -1626,7 +1626,7 @@ mod tests {
                 SigningSettings::default(),
             );
 
-            let opt = AwsChunkedBodyOptions::new(stream_len, vec![]);
+            let opt = AwsChunkedBodyOptions::new(stream_len, vec![]).signed_chunked_encoding(true);
             let mut chunked_body = AwsChunkedBody::new(inner_body, opt).with_signer(signer);
 
             let mut data_frames = Vec::new();
@@ -1692,7 +1692,8 @@ mod tests {
                 SigningSettings::default(),
             );
 
-            let opt = AwsChunkedBodyOptions::new(stream_len, vec![30, 88]);
+            let opt =
+                AwsChunkedBodyOptions::new(stream_len, vec![30, 88]).signed_chunked_encoding(true);
             let mut chunked_body = AwsChunkedBody::new(inner_body, opt).with_signer(signer);
 
             let mut data_frames = Vec::new();
