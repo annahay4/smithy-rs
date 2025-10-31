@@ -3,8 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_credential_types::credential_fn;
-use aws_sigv4::http_request::{PayloadChecksumKind, SigningError};
+use aws_sigv4::http_request::SigningError;
 use aws_smithy_runtime_api::http::Headers;
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
 use bytes::{Buf, Bytes, BytesMut};
@@ -606,11 +605,7 @@ where
     }
 
     fn size_hint(&self) -> http_body_1x::SizeHint {
-        if self.signer.is_none() {
-            http_body_1x::SizeHint::with_exact(self.options.encoded_length())
-        } else {
-            http_body_1x::SizeHint::with_exact(self.options.signed_encoded_length())
-        }
+        http_body_1x::SizeHint::with_exact(self.options.encoded_length())
     }
 
     fn poll_frame(
@@ -628,11 +623,11 @@ where
                     if this.chunk_buffer.remaining() >= chunk_size {
                         let buf = this.chunk_buffer.buffered();
                         let chunk_bytes = buf.copy_to_bytes(chunk_size);
-                        let chunk = if this.signer.is_none() {
-                            http_1x_utils::unsigned_encoded_chunk(chunk_bytes)
-                        } else {
+                        let chunk = if this.options.is_signed {
                             let signer = this.signer.as_deref_mut().expect("signer must be set");
                             http_1x_utils::signed_encoded_chunk(signer, chunk_bytes).unwrap()
+                        } else {
+                            http_1x_utils::unsigned_encoded_chunk(chunk_bytes)
                         };
                         *this.inner_body_bytes_read_so_far += chunk_size;
                         tracing::trace!("writing chunk data: {:#?}", chunk);
@@ -657,11 +652,11 @@ where
                         std::cmp::min(this.chunk_buffer.remaining(), chunk_size);
                     let buf = this.chunk_buffer.buffered();
                     let chunk_bytes = buf.copy_to_bytes(bytes_len_to_read);
-                    let chunk = if this.signer.is_none() {
-                        http_1x_utils::unsigned_encoded_chunk(chunk_bytes)
-                    } else {
+                    let chunk = if this.options.is_signed {
                         let signer = this.signer.as_deref_mut().expect("signer must be set");
                         http_1x_utils::signed_encoded_chunk(signer, chunk_bytes).unwrap()
+                    } else {
+                        http_1x_utils::unsigned_encoded_chunk(chunk_bytes)
                     };
                     *this.inner_body_bytes_read_so_far += bytes_len_to_read;
                     tracing::trace!("remaining chunk data: {:#?}", chunk);
@@ -678,10 +673,10 @@ where
                     return poll_stream_len_err;
                 }
 
-                if this.signer.is_none() {
-                    *this.state = PollingTrailers;
-                } else {
+                if this.options.is_signed {
                     *this.state = WritingZeroSizedSignedChunk;
+                } else {
+                    *this.state = PollingTrailers;
                 }
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -732,7 +727,7 @@ where
                 Poll::Pending => Poll::Pending,
             },
             WritingTrailers => {
-                let mut final_chunk = if this.signer.is_none() {
+                let mut final_chunk = if !this.options.is_signed {
                     let mut zero_sized_data = BytesMut::new();
                     zero_sized_data.extend_from_slice(CHUNK_TERMINATOR_RAW);
                     zero_sized_data
@@ -742,9 +737,7 @@ where
 
                 let trailer_bytes = if let Some(mut trailer) = this.buffered_trailer.take() {
                     let mut trailer_bytes = BytesMut::new();
-                    let trailer = if trailer.is_empty() || this.signer.is_none() {
-                        trailer
-                    } else {
+                    let trailer = if this.options.is_signed && !trailer.is_empty() {
                         let signer = this.signer.as_deref_mut().expect("signer must be set");
                         let signature = signer
                             .trailer_signature(&Headers::try_from(trailer.clone()).unwrap())
@@ -753,6 +746,8 @@ where
                             http_1x::header::HeaderName::from_static("x-amz-trailer-signature"),
                             http_1x::header::HeaderValue::from_str(&signature).unwrap(),
                         );
+                        trailer
+                    } else {
                         trailer
                     };
 
