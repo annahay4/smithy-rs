@@ -24,8 +24,10 @@ import software.amazon.smithy.rust.codegen.core.util.hasStreamingMember
 
 class AwsChunkedContentEncodingDecorator : ClientCodegenDecorator {
     override val name: String = "AwsChunkedContentEncoding"
-    // This decorator must decorate after HttpRequestChecksumDecorator so that AwsChunkedBody wraps ChencksumBody
-    override val order: Byte = (HttpRequestChecksumDecorator.ORDER - 1).toByte()
+    // This decorator must decorate after any of the following:
+    // - HttpRequestChecksumDecorator
+    // - HttpRequestCompressionDecorator
+    override val order: Byte = (minOf(HttpRequestChecksumDecorator.ORDER, HttpRequestCompressionDecorator.ORDER) - 1).toByte()
 
     override fun operationCustomizations(
         codegenContext: ClientCodegenContext,
@@ -56,7 +58,6 @@ private class AwsChunkedOparationCustomization(
                     }
 
                     section.registerInterceptor(runtimeConfig, this) {
-                        val runtimeApi = RuntimeType.smithyRuntimeApiClient(runtimeConfig)
                         rustTemplate(
                             """
                             #{AwsChunkedContentEncodingInterceptor}
