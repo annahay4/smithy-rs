@@ -6,13 +6,15 @@
 
 #![allow(dead_code)]
 
+use std::vec;
+
 use aws_runtime::{
     auth::PayloadSigningOverride,
     content_encoding::{
         header_value::AWS_CHUNKED, AwsChunkedBody, AwsChunkedBodyOptions, DeferredSigner,
     },
 };
-use aws_smithy_checksums::http::HttpChecksum;
+use aws_smithy_checksums::{http::HttpChecksum, ChecksumAlgorithm};
 use aws_smithy_runtime_api::{
     box_error::BoxError,
     client::{
@@ -25,6 +27,10 @@ use http_1x::HeaderValue;
 use http_body_1x::Body;
 
 use crate::presigning::PresigningMarker;
+
+const X_AMZ_TRAILER_SIGNATURE: &str = "x-amz-trailer-signature";
+const TRAILER_SEPARATOR: &[u8] = b":";
+const SIGNATURE_VALUE_LENGTH: usize = 64;
 
 #[derive(Debug)]
 pub(crate) struct AwsChunkedContentEncodingInterceptor;
@@ -41,87 +47,63 @@ impl Intercept for AwsChunkedContentEncodingInterceptor {
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         if cfg.load::<PresigningMarker>().is_some() {
-            // Presigning, no need to apply aws-chunked encoding
             return Ok(());
         }
 
-        // Let TLS handle encryption, and we only need explicit signing when using HTTP
-        let sign_during_aws_chunked_encoding = context.request().uri().starts_with("http:");
-
-        if context
-            .request()
-            .headers()
-            .contains_key(http_1x::header::HeaderName::from_static("x-amz-trailer"))
-        {
-            if sign_during_aws_chunked_encoding {
-                let (signer, sender) = DeferredSigner::new();
-                cfg.interceptor_state().store_put(signer);
-                cfg.interceptor_state().store_put(sender);
-                cfg.interceptor_state()
-                    .store_put(PayloadSigningOverride::StreamingSignedPayloadTrailer);
-            } else {
-                cfg.interceptor_state()
-                    .store_put(PayloadSigningOverride::StreamingUnsignedPayloadTrailer);
-            }
+        if context.request().body().bytes().is_some() {
+            return Ok(());
         }
 
-        let request = context.request_mut();
-
-        let original_body_size = match request
+        let original_body_size = if let Some(size) = context
+            .request()
             .headers()
             .get(http_1x::header::CONTENT_LENGTH)
             .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| request.body().size_hint().exact())
+            .or_else(|| context.request().body().size_hint().exact())
         {
-            Some(size) => Some(size),
-            _ => {
-                return Err(BuildError::other(
-                    crate::http_request_checksum::Error::UnsizedRequestBody,
-                ))?
-            }
+            size
+        } else {
+            return Err(BuildError::other(
+                crate::http_request_checksum::Error::UnsizedRequestBody,
+            ))?;
         };
 
-        // For streaming case, we set x-amz-decoded-content-length and content-length headers
-        if let Some(size) = original_body_size {
-            if request.body().bytes().is_none() {
-                let state = cfg
-                    .load::<crate::http_request_checksum::RequestChecksumInterceptorState>()
-                    .clone()
-                    .expect("state set");
-                let checksum_algorithm = state.checksum_algorithm().clone().unwrap();
-                let checksum = checksum_algorithm.into_impl();
-                let trailer_len = HttpChecksum::size(checksum.as_ref());
-                let mut opt = AwsChunkedBodyOptions::new(size, vec![trailer_len]);
-                let encoded_content_length = if sign_during_aws_chunked_encoding {
-                    opt = opt.with_trailer_len(88); // 88 is the length of the signature trailer
-                    opt.signed_encoded_length()
-                } else {
-                    opt.encoded_length()
-                };
-                request.headers_mut().insert(
-                    http::header::CONTENT_LENGTH,
-                    HeaderValue::from(encoded_content_length),
-                );
+        let state = cfg
+            .load::<crate::http_request_checksum::RequestChecksumInterceptorState>()
+            .expect("state set");
 
-                request.headers_mut().insert(
-                    http_1x::header::HeaderName::from_static("x-amz-decoded-content-length"),
-                    HeaderValue::from(size),
-                );
+        let sign_during_aws_chunked_encoding = context.request().uri().starts_with("http:");
+        let chunked_boty_options = create_chunked_body_options(
+            state.checksum_algorithm(),
+            sign_during_aws_chunked_encoding,
+            original_body_size,
+            cfg,
+        );
 
-                request.headers_mut().append(
-                    http_1x::header::CONTENT_ENCODING,
-                    HeaderValue::from_str(AWS_CHUNKED)
-                        .map_err(BuildError::other)
-                        .expect("\"aws-chunked\" will always be a valid HeaderValue"),
-                );
+        let request = context.request_mut();
 
-                request
-                    .headers_mut()
-                    .remove(http_1x::header::TRANSFER_ENCODING);
+        request.headers_mut().insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from(chunked_boty_options.encoded_length()),
+        );
 
-                cfg.interceptor_state().store_put(opt);
-            }
-        }
+        request.headers_mut().insert(
+            http_1x::header::HeaderName::from_static("x-amz-decoded-content-length"),
+            HeaderValue::from(original_body_size),
+        );
+
+        request.headers_mut().append(
+            http_1x::header::CONTENT_ENCODING,
+            HeaderValue::from_str(AWS_CHUNKED)
+                .map_err(BuildError::other)
+                .expect("\"aws-chunked\" will always be a valid HeaderValue"),
+        );
+
+        request
+            .headers_mut()
+            .remove(http_1x::header::TRANSFER_ENCODING);
+
+        cfg.interceptor_state().store_put(chunked_boty_options);
 
         Ok(())
     }
@@ -168,5 +150,45 @@ impl Intercept for AwsChunkedContentEncodingInterceptor {
         std::mem::swap(request.body_mut(), &mut body);
 
         Ok(())
+    }
+}
+
+fn create_chunked_body_options(
+    checksum_algorithm: Option<ChecksumAlgorithm>,
+    sign_during_aws_chunked_encoding: bool,
+    original_body_size: u64,
+    cfg: &mut ConfigBag,
+) -> AwsChunkedBodyOptions {
+    // Let TLS handle encryption, and we only need explicit signing when using HTTP
+    if sign_during_aws_chunked_encoding {
+        let (signer, sender) = DeferredSigner::new();
+        cfg.interceptor_state().store_put(signer);
+        cfg.interceptor_state().store_put(sender);
+        cfg.interceptor_state()
+            .store_put(PayloadSigningOverride::StreamingSignedPayloadTrailer);
+    } else {
+        cfg.interceptor_state()
+            .store_put(PayloadSigningOverride::StreamingUnsignedPayloadTrailer);
+    }
+
+    let chunked_body_options = AwsChunkedBodyOptions::new(original_body_size, vec![])
+        .signed_chunked_encoding(sign_during_aws_chunked_encoding);
+
+    if let Some(alg) = checksum_algorithm {
+        let checksum = alg.into_impl();
+        let trailer_len = HttpChecksum::size(checksum.as_ref());
+        if sign_during_aws_chunked_encoding {
+            chunked_body_options
+                .with_trailer_len(trailer_len)
+                .with_trailer_len(
+                    (X_AMZ_TRAILER_SIGNATURE.len()
+                        + TRAILER_SEPARATOR.len()
+                        + SIGNATURE_VALUE_LENGTH) as u64,
+                )
+        } else {
+            chunked_body_options.with_trailer_len(trailer_len)
+        }
+    } else {
+        chunked_body_options
     }
 }

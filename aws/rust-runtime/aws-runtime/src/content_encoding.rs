@@ -131,6 +131,8 @@ pub struct AwsChunkedBodyOptions {
     trailer_lengths: Vec<u64>,
     /// The size of each chunk in bytes, only for testing.
     chunk_size: Option<usize>,
+    /// Whether chunks and trailer are signed.
+    is_signed: bool,
 }
 
 impl Storable for AwsChunkedBodyOptions {
@@ -144,6 +146,7 @@ impl AwsChunkedBodyOptions {
             stream_length,
             trailer_lengths,
             chunk_size: None,
+            is_signed: false,
         }
     }
 
@@ -170,7 +173,20 @@ impl AwsChunkedBodyOptions {
         self
     }
 
-    pub fn signed_encoded_length(&self) -> u64 {
+    pub fn signed_chunked_encoding(mut self, is_signed: bool) -> Self {
+        self.is_signed = is_signed;
+        self
+    }
+
+    pub fn encoded_length(&self) -> u64 {
+        if self.is_signed {
+            self.signed_encoded_length()
+        } else {
+            self.unsigned_encoded_length()
+        }
+    }
+
+    fn signed_encoded_length(&self) -> u64 {
         let mut length = 0;
 
         let number_of_data_chunks = self.stream_length / self.chunk_size() as u64;
@@ -200,7 +216,7 @@ impl AwsChunkedBodyOptions {
         length
     }
 
-    pub fn encoded_length(&self) -> u64 {
+    fn unsigned_encoded_length(&self) -> u64 {
         let mut length = 0;
 
         let number_of_data_chunks = self.stream_length / self.chunk_size() as u64;
