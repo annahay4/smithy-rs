@@ -83,6 +83,7 @@ data class ServerRustSettings(
 /**
  * [publicConstrainedTypes]: Generate constrained wrapper newtypes for constrained shapes
  * [ignoreUnsupportedConstraints]: Generate model even though unsupported constraints are present
+ * [http1x]: Enable HTTP 1.x support (hyper 1.x and http 1.x types)
  */
 data class ServerCodegenConfig(
     override val formatTimeoutSeconds: Int = DEFAULT_FORMAT_TIMEOUT_SECONDS,
@@ -98,6 +99,7 @@ data class ServerCodegenConfig(
     val experimentalCustomValidationExceptionWithReasonPleaseDoNotUse: String? = defaultExperimentalCustomValidationExceptionWithReasonPleaseDoNotUse,
     val addValidationExceptionToConstrainedOperations: Boolean = DEFAULT_ADD_VALIDATION_EXCEPTION_TO_CONSTRAINED_OPERATIONS,
     val alwaysSendEventStreamInitialResponse: Boolean = DEFAULT_SEND_EVENT_STREAM_INITIAL_RESPONSE,
+    val http1x: Boolean = DEFAULT_HTTP_1X,
 ) : CoreCodegenConfig(
         formatTimeoutSeconds, debugMode,
     ) {
@@ -107,11 +109,51 @@ data class ServerCodegenConfig(
         private val defaultExperimentalCustomValidationExceptionWithReasonPleaseDoNotUse = null
         private const val DEFAULT_ADD_VALIDATION_EXCEPTION_TO_CONSTRAINED_OPERATIONS = false
         private const val DEFAULT_SEND_EVENT_STREAM_INITIAL_RESPONSE = false
+        private const val DEFAULT_HTTP_1X = false
+
+        /**
+         * Configuration key for the HTTP 1.x flag.
+         *
+         * When set to true in codegen configuration, generates code that uses http@1.x/hyper@1.x
+         * instead of http@0.2.x/hyper@0.14.x.
+         *
+         * **Usage:**
+         * - Use this constant when reading/writing the codegen configuration
+         * - Use this constant in test utilities that set configuration (e.g., ServerCodegenIntegrationTest)
+         *
+         * **Do NOT use this constant for:**
+         * - External crate feature names (e.g., `smithyRuntimeApi.withFeature("http-1x")`)
+         *   Those feature names are defined by the external crates and may change independently
+         * - Cargo.toml feature names unless they are explicitly defined by us to match this value
+         */
+        const val HTTP_1X_CONFIG_KEY = "http-1x"
+
+        private val KNOWN_CONFIG_KEYS =
+            setOf(
+                "formatTimeoutSeconds",
+                "debugMode",
+                "publicConstrainedTypes",
+                "ignoreUnsupportedConstraints",
+                "experimentalCustomValidationExceptionWithReasonPleaseDoNotUse",
+                "addValidationExceptionToConstrainedOperations",
+                "alwaysSendEventStreamInitialResponse",
+                HTTP_1X_CONFIG_KEY,
+            )
 
         fun fromCodegenConfigAndNode(
             coreCodegenConfig: CoreCodegenConfig,
             node: Optional<ObjectNode>,
         ) = if (node.isPresent) {
+            // Validate that all config keys are known
+            val configNode = node.get()
+            val unknownKeys = configNode.members.keys.map { it.toString() }.filter { it !in KNOWN_CONFIG_KEYS }
+            if (unknownKeys.isNotEmpty()) {
+                throw IllegalArgumentException(
+                    "Unknown codegen configuration key(s): ${unknownKeys.joinToString(", ")}. " +
+                        "Known keys are: ${KNOWN_CONFIG_KEYS.joinToString(", ")}. ",
+                )
+            }
+
             ServerCodegenConfig(
                 formatTimeoutSeconds = coreCodegenConfig.formatTimeoutSeconds,
                 debugMode = coreCodegenConfig.debugMode,
@@ -138,6 +180,11 @@ data class ServerCodegenConfig(
                     node.get().getBooleanMemberOrDefault(
                         "alwaysSendEventStreamInitialResponse",
                         DEFAULT_SEND_EVENT_STREAM_INITIAL_RESPONSE,
+                    ),
+                http1x =
+                    node.get().getBooleanMemberOrDefault(
+                        HTTP_1X_CONFIG_KEY,
+                        DEFAULT_HTTP_1X,
                     ),
             )
         } else {

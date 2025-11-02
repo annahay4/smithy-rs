@@ -27,6 +27,7 @@ class EventStreamSymbolProvider(
     private val runtimeConfig: RuntimeConfig,
     base: RustSymbolProvider,
     private val target: CodegenTarget,
+    private val smithyHttpDependency: CargoDependency = CargoDependency.smithyHttp(runtimeConfig),
 ) : WrappingSymbolProvider(base) {
     override fun toSymbol(shape: Shape): Symbol {
         val initial = super.toSymbol(shape)
@@ -46,7 +47,7 @@ class EventStreamSymbolProvider(
                 val unionShape = model.expectShape(shape.target).asUnionShape().get()
                 val error =
                     if (target == CodegenTarget.SERVER && unionShape.eventStreamErrors().isEmpty()) {
-                        RuntimeType.smithyHttp(runtimeConfig).resolve("event_stream::MessageStreamError").toSymbol()
+                        smithyHttpDependency.toType().resolve("event_stream::MessageStreamError").toSymbol()
                     } else {
                         symbolForEventStreamError(unionShape)
                     }
@@ -57,10 +58,10 @@ class EventStreamSymbolProvider(
                         (shape.isOutputEventStream(model) && target == CodegenTarget.SERVER)
                 val outer =
                     when (isSender) {
-                        true -> RuntimeType.eventStreamSender(runtimeConfig).toSymbol().rustType()
+                        true -> smithyHttpDependency.toType().resolve("event_stream::EventStreamSender").toSymbol().rustType()
                         else -> {
                             if (target == CodegenTarget.SERVER) {
-                                RuntimeType.eventStreamReceiver(runtimeConfig).toSymbol().rustType()
+                                smithyHttpDependency.toType().resolve("event_stream::Receiver").toSymbol().rustType()
                             } else {
                                 RuntimeType.eventReceiver(runtimeConfig).toSymbol().rustType()
                             }
@@ -71,7 +72,7 @@ class EventStreamSymbolProvider(
                     .name(rustType.name)
                     .rustType(rustType)
                     .addReference(initial)
-                    .addDependency(CargoDependency.smithyHttp(runtimeConfig).withFeature("event-stream"))
+                    .addDependency(smithyHttpDependency.withFeature("event-stream"))
                     .addReference(error)
                     .build()
             }

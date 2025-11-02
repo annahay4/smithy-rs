@@ -16,16 +16,28 @@ fun String.runCommand(
     workdir: Path? = null,
     environment: Map<String, String> = mapOf(),
     timeout: Long = 3600,
-    redirect: ProcessBuilder.Redirect = ProcessBuilder.Redirect.PIPE,
+    redirect: ProcessBuilder.Redirect? = null,
 ): String {
     val logger = Logger.getLogger("RunCommand")
     logger.fine("Invoking comment $this in `$workdir` with env $environment")
     val start = System.currentTimeMillis()
+
+    // Use INHERIT (realtime output) only when debug is enabled via system property or environment variable
+    val isDebugMode =
+        System.getProperty("smithy.debug") == "true" ||
+            System.getenv("SMITHY_DEBUG") == "true"
+    val actualRedirect =
+        redirect ?: if (isDebugMode) {
+            ProcessBuilder.Redirect.INHERIT
+        } else {
+            ProcessBuilder.Redirect.PIPE
+        }
+
     val parts = this.split("\\s".toRegex())
     val builder =
         ProcessBuilder(*parts.toTypedArray())
-            .redirectOutput(redirect)
-            .redirectError(redirect)
+            .redirectOutput(actualRedirect)
+            .redirectError(actualRedirect)
             .letIf(workdir != null) {
                 it.directory(workdir?.toFile())
             }
@@ -35,9 +47,17 @@ fun String.runCommand(
     try {
         val proc = builder.start()
         proc.waitFor(timeout, TimeUnit.SECONDS)
-        val stdErr = proc.errorStream.bufferedReader().readText()
-        val stdOut = proc.inputStream.bufferedReader().readText()
-        val output = "$stdErr\n$stdOut"
+
+        // When using INHERIT, streams are not available to read from
+        val output =
+            if (actualRedirect == ProcessBuilder.Redirect.PIPE) {
+                val stdErr = proc.errorStream.bufferedReader().readText()
+                val stdOut = proc.inputStream.bufferedReader().readText()
+                "$stdErr\n$stdOut"
+            } else {
+                ""
+            }
+
         return when (proc.exitValue()) {
             0 -> output
             else -> throw CommandError("Command Error\n$output")

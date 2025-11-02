@@ -23,6 +23,7 @@ import software.amazon.smithy.model.traits.HttpPayloadTrait
 import software.amazon.smithy.model.traits.HttpTrait
 import software.amazon.smithy.model.traits.MediaTypeTrait
 import software.amazon.smithy.rust.codegen.core.rustlang.Attribute
+import software.amazon.smithy.rust.codegen.core.rustlang.CargoDependency
 import software.amazon.smithy.rust.codegen.core.rustlang.RustModule
 import software.amazon.smithy.rust.codegen.core.rustlang.RustType
 import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
@@ -148,8 +149,7 @@ class ServerHttpBoundProtocolPayloadGenerator(
                         #{event_stream}
                     }
                     """,
-                    "aws_smithy_http" to
-                        RuntimeType.smithyHttp(codegenContext.runtimeConfig),
+                    "smithyHttpModule" to codegenContext.httpDependencies().smithyHttpModule(),
                     "NoOpSigner" to
                         RuntimeType.smithyEventStream(codegenContext.runtimeConfig)
                             .resolve("frame::NoOpSigner"),
@@ -159,6 +159,7 @@ class ServerHttpBoundProtocolPayloadGenerator(
                     "event_stream" to eventStreamWithInitialResponse(codegenContext, protocol, params),
                 )
             },
+            smithyHttpDependency = codegenContext.httpDependencies().smithyHttp,
         )
 
 /*
@@ -179,30 +180,34 @@ class ServerHttpBoundProtocolTraitImplGenerator(
     private val httpBindingResolver = protocol.httpBindingResolver
     private val protocolFunctions = ProtocolFunctions(codegenContext)
 
+    // Get HTTP dependencies once based on http-1x configuration
+    private val httpDeps = codegenContext.httpDependencies()
+
     private val codegenScope =
         arrayOf(
             "AsyncTrait" to ServerCargoDependency.AsyncTrait.toType(),
+            "Bytes" to CargoDependency.Bytes.toType(),
             "Cow" to RuntimeType.Cow,
-            "DateTime" to RuntimeType.dateTime(runtimeConfig),
+            "DateTime" to httpDeps.smithyTypesModule().resolve("DateTime"),
             "FormUrlEncoded" to ServerCargoDependency.FormUrlEncoded.toType(),
             "FuturesUtil" to ServerCargoDependency.FuturesUtil.toType(),
-            "HttpBody" to RuntimeType.HttpBody,
-            "header_util" to RuntimeType.smithyHttp(runtimeConfig).resolve("header"),
-            "Hyper" to RuntimeType.Hyper,
+            "HttpBody" to httpDeps.httpBodyModule(),
+            "header_util" to httpDeps.smithyHttpModule().resolve("header"),
+            "Hyper" to httpDeps.hyperModule(),
             "LazyStatic" to RuntimeType.LazyStatic,
             "Mime" to ServerCargoDependency.Mime.toType(),
             "Nom" to ServerCargoDependency.Nom.toType(),
             "PercentEncoding" to RuntimeType.PercentEncoding,
             "Regex" to RuntimeType.Regex,
-            "SmithyHttpServer" to
-                ServerCargoDependency.smithyHttpServer(runtimeConfig).toType(),
-            "SmithyTypes" to RuntimeType.smithyTypes(runtimeConfig),
-            "RuntimeError" to protocol.runtimeError(runtimeConfig),
-            "RequestRejection" to protocol.requestRejection(runtimeConfig),
-            "ResponseRejection" to protocol.responseRejection(runtimeConfig),
+            "SmithyHttpServer" to httpDeps.smithyHttpServer.toType(),
+            "SmithyTypes" to httpDeps.smithyTypesModule(),
+            "RuntimeError" to protocol.runtimeError(httpDeps.smithyHttpServer),
+            "RequestRejection" to protocol.requestRejection(httpDeps.smithyHttpServer),
+            "ResponseRejection" to protocol.responseRejection(httpDeps.smithyHttpServer),
             "PinProjectLite" to ServerCargoDependency.PinProjectLite.toType(),
-            "http" to RuntimeType.Http,
+            "http" to httpDeps.httpModule(),
             "Tracing" to RuntimeType.Tracing,
+            *preludeScope,
         )
 
     fun generateTraitImpls(
@@ -554,8 +559,18 @@ class ServerHttpBoundProtocolTraitImplGenerator(
 
         operationShape.outputShape(model).findStreamingMember(model)?.let {
             val payloadGenerator = ServerHttpBoundProtocolPayloadGenerator(codegenContext, protocol)
+
+            // For HTTP 1.x, use the wrap_stream function instead of Body::wrap_stream method
+            // since Body is just a type alias for hyper::body::Incoming
+            val wrapStreamCall =
+                if (codegenContext.isHttp1()) {
+                    "let body = #{SmithyHttpServer}::body::boxed(#{SmithyHttpServer}::body::wrap_stream("
+                } else {
+                    "let body = #{SmithyHttpServer}::body::boxed(#{SmithyHttpServer}::body::Body::wrap_stream("
+                }
+
             withBlockTemplate(
-                "let body = #{SmithyHttpServer}::body::boxed(#{SmithyHttpServer}::body::Body::wrap_stream(",
+                wrapStreamCall,
                 "));",
                 *codegenScope,
             ) {
@@ -748,10 +763,9 @@ class ServerHttpBoundProtocolTraitImplGenerator(
             let #{RequestParts} { uri, headers, body, .. } = #{Request}::try_from(request)?.into_parts();
             """,
             *preludeScope,
-            "ParseError" to RuntimeType.smithyHttp(runtimeConfig).resolve("header::ParseError"),
-            "Request" to RuntimeType.smithyRuntimeApi(runtimeConfig).resolve("http::Request"),
-            "RequestParts" to
-                RuntimeType.smithyRuntimeApi(runtimeConfig).resolve("http::RequestParts"),
+            "ParseError" to httpDeps.smithyHttpModule().resolve("header::ParseError"),
+            "Request" to httpDeps.smithyRuntimeApiModule().resolve("http::Request"),
+            "RequestParts" to httpDeps.smithyRuntimeApiModule().resolve("http::RequestParts"),
         )
         val parser = structuredDataParser.serverInputParser(operationShape)
 
@@ -764,7 +778,24 @@ class ServerHttpBoundProtocolTraitImplGenerator(
             // there's something to parse (i.e. `parser != null`), so `!!` is safe here.
             val expectedRequestContentType =
                 httpBindingResolver.requestContentType(operationShape)!!
-            rustTemplate("let bytes = #{Hyper}::body::to_bytes(body).await?;", *codegenScope)
+
+            // Generate different body collection code based on HTTP version
+            if (codegenContext.isHttp1()) {
+                // For HTTP 1.x: use http-body-util's BodyExt trait
+                rustTemplate(
+                    """
+                    let bytes = {
+                        use #{HttpBodyUtil}::BodyExt;
+                        body.collect().await?.to_bytes()
+                    };
+                    """,
+                    *codegenScope,
+                    "HttpBodyUtil" to httpDeps.httpBodyUtil!!.toType(),
+                )
+            } else {
+                // For HTTP 0.x: use hyper's to_bytes
+                rustTemplate("let bytes = #{Hyper}::body::to_bytes(body).await?;", *codegenScope)
+            }
             // Note that the server is being very lenient here. We're accepting an empty body for when there is modeled
             // operation input; we simply parse it as empty operation input.
             // This behavior applies to all protocols. This might seem like a bug, but it isn't. There's protocol tests
@@ -910,7 +941,7 @@ class ServerHttpBoundProtocolTraitImplGenerator(
                             rustTemplate(
                                 """
                                 {
-                                    let mut receiver = #{Deserializer}(&mut body.into().into_inner())?;
+                                    let mut receiver = #{Deserializer}(&mut #{eventStreamBodyInto})?;
                                     if let Some(_initial_event) = receiver
                                         .try_recv_initial(#{InitialMessageType}::Request)
                                         .await
@@ -927,20 +958,22 @@ class ServerHttpBoundProtocolTraitImplGenerator(
                                 """,
                                 "Deserializer" to deserializer,
                                 "InitialMessageType" to
-                                    RuntimeType.smithyHttp(runtimeConfig)
+                                    httpDeps.smithyHttp.toType()
                                         .resolve("event_stream::InitialMessageType"),
                                 "parseInitialRequest" to parseInitialRequest,
                                 "AllowUselessConversion" to Attribute.AllowClippyUselessConversion.writable(),
+                                "eventStreamBodyInto" to eventStreamBodyInto(),
                                 *codegenScope,
                             )
                         } else {
                             rustTemplate(
                                 """
                                 {
-                                    Some(#{Deserializer}(&mut body.into().into_inner())?)
+                                    Some(#{Deserializer}(&mut #{eventStreamBodyInto})?)
                                 }
                                 """,
                                 "Deserializer" to deserializer,
+                                "eventStreamBodyInto" to eventStreamBodyInto(),
                                 *codegenScope,
                             )
                         }
@@ -979,18 +1012,40 @@ class ServerHttpBoundProtocolTraitImplGenerator(
                                         }
                                     }
                             }
-                        rustTemplate(
-                            """
-                            {
-                                let bytes = #{Hyper}::body::to_bytes(body).await?;
-                                #{VerifyRequestContentTypeHeader:W}
-                                #{Deserializer}(&bytes)?
-                            }
-                            """,
-                            "Deserializer" to deserializer,
-                            "VerifyRequestContentTypeHeader" to verifyRequestContentTypeHeader,
-                            *codegenScope,
-                        )
+                        // Generate different body collection code based on HTTP version
+                        if (codegenContext.isHttp1()) {
+                            // For HTTP 1.x: use http-body-util's BodyExt trait
+                            rustTemplate(
+                                """
+                                {
+                                    let bytes = {
+                                        use #{HttpBodyUtil}::BodyExt;
+                                        body.collect().await?.to_bytes()
+                                    };
+                                    #{VerifyRequestContentTypeHeader:W}
+                                    #{Deserializer}(&bytes)?
+                                }
+                                """,
+                                "Deserializer" to deserializer,
+                                "VerifyRequestContentTypeHeader" to verifyRequestContentTypeHeader,
+                                *codegenScope,
+                                "HttpBodyUtil" to httpDeps.httpBodyUtil!!.toType(),
+                            )
+                        } else {
+                            // For HTTP 0.x: use hyper's to_bytes
+                            rustTemplate(
+                                """
+                                {
+                                    let bytes = #{Hyper}::body::to_bytes(body).await?;
+                                    #{VerifyRequestContentTypeHeader:W}
+                                    #{Deserializer}(&bytes)?
+                                }
+                                """,
+                                "Deserializer" to deserializer,
+                                "VerifyRequestContentTypeHeader" to verifyRequestContentTypeHeader,
+                                *codegenScope,
+                            )
+                        }
                     }
                 }
             }
@@ -1260,7 +1315,7 @@ class ServerHttpBoundProtocolTraitImplGenerator(
                                     """
                                     let v = <_ as #T>::parse_smithy_primitive(&v)?;
                                     """.trimIndent(),
-                                    RuntimeType.smithyTypes(runtimeConfig)
+                                    httpDeps.smithyTypesModule()
                                         .resolve("primitive::Parse"),
                                 )
                             }
@@ -1458,7 +1513,7 @@ class ServerHttpBoundProtocolTraitImplGenerator(
                             let value = <_ as #{PrimitiveParse}>::parse_smithy_primitive(value)?;
                             """,
                             "PrimitiveParse" to
-                                RuntimeType.smithyTypes(runtimeConfig)
+                                httpDeps.smithyTypesModule()
                                     .resolve("primitive::Parse"),
                         )
                     }
@@ -1470,9 +1525,27 @@ class ServerHttpBoundProtocolTraitImplGenerator(
 
     private fun streamingBodyTraitBounds(operationShape: OperationShape) =
         if (operationShape.inputShape(model).hasStreamingMember(model)) {
-            "\n B: Into<#{SmithyTypes}::byte_stream::ByteStream>,"
+            if (codegenContext.isHttp1()) {
+                // HTTP/1: No Into<ByteStream> available, must use ByteStream::from_body_1_x() which requires Send + Sync.
+                // HTTP/0.4: Uses Into<ByteStream> conversion without these bounds.
+                """
+                B: #{HttpBody}::Body<Data = #{Bytes}::Bytes> + #{Send} + #{Sync} + 'static,
+                B::Error: Into<::aws_smithy_types::body::Error> + 'static,
+                """
+            } else {
+                "\n B: Into<#{SmithyTypes}::byte_stream::ByteStream>,"
+            }
         } else {
             ""
+        }
+
+    private fun eventStreamBodyInto() =
+        writable {
+            if (codegenContext.isHttp1()) {
+                rustTemplate("#{SmithyTypes}::body::SdkBody::from_body_1_x(body)", *codegenScope)
+            } else {
+                rust("body.into().into_inner()")
+            }
         }
 
     private fun httpBindingGenerator(operationShape: OperationShape) =
