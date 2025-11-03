@@ -159,7 +159,7 @@ class ServerHttpBoundProtocolPayloadGenerator(
                     "event_stream" to eventStreamWithInitialResponse(codegenContext, protocol, params),
                 )
             },
-            smithyHttpDependency = codegenContext.httpDependencies().smithyHttp,
+            smithyHttpType = codegenContext.httpDependencies().smithyHttp.toType(),
         )
 
 /*

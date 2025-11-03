@@ -57,7 +57,7 @@ class HttpBoundProtocolPayloadGenerator(
     private val protocol: Protocol,
     private val httpMessageType: HttpMessageType = HttpMessageType.REQUEST,
     private val renderEventStreamBody: (RustWriter, EventStreamBodyParams) -> Unit,
-    private val smithyHttpDependency: CargoDependency = CargoDependency.smithyHttp(codegenContext.runtimeConfig),
+    private val smithyHttpType: RuntimeType = RuntimeType.smithyHttp(codegenContext.runtimeConfig),
 ) : ProtocolPayloadGenerator {
     private val symbolProvider = codegenContext.symbolProvider
     private val model = codegenContext.model
@@ -70,7 +70,7 @@ class HttpBoundProtocolPayloadGenerator(
             "hyper" to CargoDependency.HyperWithStream.toType(),
             "SdkBody" to RuntimeType.sdkBody(runtimeConfig),
             "BuildError" to runtimeConfig.operationBuildError(),
-            "SmithyHttp" to smithyHttpDependency.toType(),
+            "SmithyHttp" to smithyHttpType,
             "NoOpSigner" to smithyEventStream.resolve("frame::NoOpSigner"),
             *RuntimeType.preludeScope,
         )
@@ -265,7 +265,7 @@ class HttpBoundProtocolPayloadGenerator(
                 unionShape,
                 serializerGenerator,
                 payloadContentType,
-                smithyHttpDependency,
+                smithyHttpType,
             ).render()
 
         val eventStreamMarshallerGenerator =

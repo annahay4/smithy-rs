@@ -12,7 +12,6 @@ import software.amazon.smithy.model.shapes.StructureShape
 import software.amazon.smithy.model.shapes.UnionShape
 import software.amazon.smithy.model.traits.EventHeaderTrait
 import software.amazon.smithy.model.traits.EventPayloadTrait
-import software.amazon.smithy.rust.codegen.core.rustlang.CargoDependency
 import software.amazon.smithy.rust.codegen.core.rustlang.RustModule
 import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
 import software.amazon.smithy.rust.codegen.core.rustlang.render
@@ -43,14 +42,14 @@ class EventStreamErrorMarshallerGenerator(
     private val unionShape: UnionShape,
     private val serializerGenerator: StructuredDataSerializerGenerator,
     payloadContentType: String,
-    private val smithyHttpDependency: CargoDependency = CargoDependency.smithyHttp(runtimeConfig),
+    private val smithyHttpType: RuntimeType = RuntimeType.smithyHttp(runtimeConfig),
 ) : EventStreamMarshallerGenerator(model, target, runtimeConfig, symbolProvider, unionShape, serializerGenerator, payloadContentType) {
     private val smithyEventStream = RuntimeType.smithyEventStream(runtimeConfig)
     private val smithyTypes = RuntimeType.smithyTypes(runtimeConfig)
 
     private val operationErrorSymbol =
         if (target == CodegenTarget.SERVER && unionShape.eventStreamErrors().isEmpty()) {
-            smithyHttpDependency.toType().resolve("event_stream::MessageStreamError").toSymbol()
+            smithyHttpType.resolve("event_stream::MessageStreamError").toSymbol()
         } else {
             symbolProvider.symbolForEventStreamError(unionShape)
         }
