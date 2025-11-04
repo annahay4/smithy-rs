@@ -11,7 +11,7 @@ use bytes_utils::SegmentedBuf;
 use pin_project_lite::pin_project;
 
 use std::pin::Pin;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context, Poll};
 
 const CRLF: &str = "\r\n";
@@ -41,10 +41,10 @@ pub(crate) trait SignChunk: std::fmt::Debug {
     fn trailer_signature(&mut self, trailing_headers: &Headers) -> Result<String, SigningError>;
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DeferredSigner {
-    rx: Option<Mutex<mpsc::Receiver<Box<dyn SignChunk + Send + Sync>>>>,
-    signer: Option<Box<dyn SignChunk + Send + Sync>>,
+    rx: Arc<Mutex<Option<mpsc::Receiver<Box<dyn SignChunk + Send + Sync>>>>>,
+    signer: Arc<Mutex<Option<Box<dyn SignChunk + Send + Sync>>>>,
 }
 
 impl Storable for DeferredSigner {
@@ -69,8 +69,8 @@ impl DeferredSigner {
         let (tx, rx) = mpsc::channel();
         (
             Self {
-                rx: Some(Mutex::new(rx)),
-                signer: None,
+                rx: Arc::new(Mutex::new(Some(rx))),
+                signer: Default::default(),
             },
             DeferredSignerSender { tx: Mutex::new(tx) },
         )
@@ -79,26 +79,20 @@ impl DeferredSigner {
     /// Create an empty `DeferredSigner`, typically used as a placeholder for `std::mem::replace`
     pub fn empty() -> Self {
         Self {
-            rx: None,
-            signer: None,
+            rx: Default::default(),
+            signer: Default::default(),
         }
     }
 
-    fn acquire(&mut self) -> &mut (dyn SignChunk + Send + Sync) {
-        if self.signer.is_some() {
-            self.signer.as_mut().unwrap().as_mut()
-        } else {
-            self.signer = Some(
-                self.rx
-                    .take()
-                    .expect("only taken once")
-                    .lock()
-                    .unwrap()
-                    .try_recv()
-                    .ok()
-                    .unwrap(),
-            );
-            self.acquire()
+    fn ensure_signer(&mut self) {
+        let mut signer = self.signer.lock().unwrap();
+        if signer.is_none() {
+            let mut rx = self.rx.lock().unwrap();
+            if let Some(receiver) = rx.take() {
+                if let Ok(new_signer) = receiver.try_recv() {
+                    *signer = Some(new_signer);
+                }
+            }
         }
     }
 }
@@ -109,16 +103,28 @@ impl Storable for DeferredSignerSender {
 
 impl SignChunk for DeferredSigner {
     fn chunk_signature(&mut self, chunk: &Bytes) -> Result<String, SigningError> {
-        self.acquire().chunk_signature(chunk)
+        self.ensure_signer();
+        self.signer
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .chunk_signature(chunk)
     }
 
     fn trailer_signature(&mut self, trailing_headers: &Headers) -> Result<String, SigningError> {
-        self.acquire().trailer_signature(trailing_headers)
+        self.ensure_signer();
+        self.signer
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .trailer_signature(trailing_headers)
     }
 }
 
 /// Options used when constructing an [`AwsChunkedBody`].
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct AwsChunkedBodyOptions {
     /// The total size of the stream. Because we only support unsigned encoding
