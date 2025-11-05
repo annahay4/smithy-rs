@@ -15,8 +15,8 @@ import software.amazon.smithy.rust.codegen.core.testutil.testModule
 import software.amazon.smithy.rust.codegen.core.testutil.tokioTest
 import software.amazon.smithy.rust.codegen.core.util.dq
 import software.amazon.smithy.rust.codegen.core.util.toSnakeCase
+import software.amazon.smithy.rust.codegen.server.smithy.ServerCargoDependency
 import software.amazon.smithy.rust.codegen.server.smithy.ServerCodegenContext
-import software.amazon.smithy.rust.codegen.server.smithy.testutil.HttpTestType
 import software.amazon.smithy.rust.codegen.server.smithy.testutil.ServerHttpTestHelpers
 import software.amazon.smithy.rust.codegen.server.smithy.testutil.serverIntegrationTest
 
@@ -60,7 +60,7 @@ internal class EventStreamAcceptHeaderTest {
 
     @Test
     fun acceptHeaderTests() {
-        serverIntegrationTest(model, testCoverage = HttpTestType.HTTP_0_ONLY) { codegenContext, rustCrate ->
+        serverIntegrationTest(model) { codegenContext, rustCrate ->
             rustCrate.testModule {
                 generateAcceptHeaderTest(
                     acceptHeader = "application/vnd.amazon.eventstream",
@@ -93,8 +93,8 @@ internal class EventStreamAcceptHeaderTest {
         codegenContext: ServerCodegenContext,
         testName: String = acceptHeader.toSnakeCase(),
     ) {
-        val smithyHttpServer = codegenContext.httpDependencies().smithyHttpServer.toType()
-        val httpModule = codegenContext.httpDependencies().httpModule()
+        val smithyHttpServer = ServerCargoDependency.smithyHttpServer(codegenContext.runtimeConfig).toType()
+        val httpModule = RuntimeType.httpForConfig(codegenContext.runtimeConfig)
         tokioTest("test_header_$testName") {
             rustTemplate(
                 """

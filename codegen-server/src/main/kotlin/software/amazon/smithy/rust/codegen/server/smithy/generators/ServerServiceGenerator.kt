@@ -23,6 +23,7 @@ import software.amazon.smithy.rust.codegen.core.util.hasTrait
 import software.amazon.smithy.rust.codegen.core.util.letIf
 import software.amazon.smithy.rust.codegen.core.util.toPascalCase
 import software.amazon.smithy.rust.codegen.core.util.toSnakeCase
+import software.amazon.smithy.rust.codegen.server.smithy.ServerCargoDependency
 import software.amazon.smithy.rust.codegen.server.smithy.ServerCodegenContext
 import software.amazon.smithy.rust.codegen.server.smithy.generators.protocol.ServerProtocol
 import software.amazon.smithy.rust.codegen.server.smithy.ServerRustModule.Error as ErrorModule
@@ -35,17 +36,13 @@ class ServerServiceGenerator(
     private val isConfigBuilderFallible: Boolean,
 ) {
     private val runtimeConfig = codegenContext.runtimeConfig
-
-    // Get HTTP dependencies once based on http-1x configuration
-    private val httpDeps = codegenContext.httpDependencies()
-
-    private val smithyHttpServer = httpDeps.smithyHttpServer.toType()
+    private val smithyHttpServer = ServerCargoDependency.smithyHttpServer(runtimeConfig).toType()
     private val codegenScope =
         arrayOf(
             "Bytes" to RuntimeType.Bytes,
-            "Http" to httpDeps.httpModule(),
-            "SmithyHttp" to httpDeps.smithyHttpModule(),
-            "HttpBody" to httpDeps.httpBodyModule(),
+            "Http" to RuntimeType.httpForConfig(runtimeConfig),
+            "SmithyHttp" to RuntimeType.smithyHttp(runtimeConfig),
+            "HttpBody" to RuntimeType.httpBodyForConfig(runtimeConfig),
             "SmithyHttpServer" to smithyHttpServer,
             "Tower" to RuntimeType.Tower,
             *RuntimeType.preludeScope,
@@ -592,6 +589,7 @@ class ServerServiceGenerator(
                     pub fn into_make_service(self) -> #{SmithyHttpServer}::routing::IntoMakeService<Self> {
                         #{SmithyHttpServer}::routing::IntoMakeService::new(self)
                     }
+
 
                     /// Converts [`$serviceName`] into a [`MakeService`](tower::make::MakeService) with [`ConnectInfo`](#{SmithyHttpServer}::request::connect_info::ConnectInfo).
                     pub fn into_make_service_with_connect_info<C>(self) -> #{SmithyHttpServer}::routing::IntoMakeServiceWithConnectInfo<Self, C> {

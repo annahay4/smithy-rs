@@ -12,22 +12,20 @@ import software.amazon.smithy.rust.codegen.core.rustlang.documentShape
 import software.amazon.smithy.rust.codegen.core.rustlang.rust
 import software.amazon.smithy.rust.codegen.core.rustlang.rustTemplate
 import software.amazon.smithy.rust.codegen.core.rustlang.writable
+import software.amazon.smithy.rust.codegen.core.smithy.CodegenContext
 import software.amazon.smithy.rust.codegen.core.util.dq
 import software.amazon.smithy.rust.codegen.core.util.toPascalCase
-import software.amazon.smithy.rust.codegen.server.smithy.ServerCodegenContext
+import software.amazon.smithy.rust.codegen.server.smithy.ServerCargoDependency
 
 class ServerOperationGenerator(
     private val operation: OperationShape,
-    private val codegenContext: ServerCodegenContext,
+    codegenContext: CodegenContext,
 ) {
     private val runtimeConfig = codegenContext.runtimeConfig
-
-    // Get HTTP dependencies once based on http-1x configuration
-    private val httpDeps = codegenContext.httpDependencies()
-
     private val codegenScope =
         arrayOf(
-            "SmithyHttpServer" to httpDeps.smithyHttpServer.toType(),
+            "SmithyHttpServer" to
+                ServerCargoDependency.smithyHttpServer(runtimeConfig).toType(),
         )
     private val symbolProvider = codegenContext.symbolProvider
     private val model = codegenContext.model
@@ -49,8 +47,7 @@ class ServerOperationGenerator(
     fun render(writer: RustWriter) {
         writer.documentShape(operation, model)
 
-        val generator =
-            ServerHttpSensitivityGenerator(model, operation, httpDeps.smithyHttpServer.toType(), httpDeps.httpModule())
+        val generator = ServerHttpSensitivityGenerator(model, operation, runtimeConfig)
         val requestFmt = generator.requestFmt()
         val responseFmt = generator.responseFmt()
 

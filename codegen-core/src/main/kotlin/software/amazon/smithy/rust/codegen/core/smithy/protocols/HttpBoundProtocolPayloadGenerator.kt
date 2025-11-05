@@ -14,7 +14,6 @@ import software.amazon.smithy.model.shapes.StringShape
 import software.amazon.smithy.model.shapes.StructureShape
 import software.amazon.smithy.model.shapes.UnionShape
 import software.amazon.smithy.model.traits.EnumTrait
-import software.amazon.smithy.rust.codegen.core.rustlang.CargoDependency
 import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
 import software.amazon.smithy.rust.codegen.core.rustlang.rust
 import software.amazon.smithy.rust.codegen.core.rustlang.rustBlockTemplate
@@ -57,7 +56,6 @@ class HttpBoundProtocolPayloadGenerator(
     private val protocol: Protocol,
     private val httpMessageType: HttpMessageType = HttpMessageType.REQUEST,
     private val renderEventStreamBody: (RustWriter, EventStreamBodyParams) -> Unit,
-    private val smithyHttpType: RuntimeType = RuntimeType.smithyHttp(codegenContext.runtimeConfig),
 ) : ProtocolPayloadGenerator {
     private val symbolProvider = codegenContext.symbolProvider
     private val model = codegenContext.model
@@ -67,10 +65,9 @@ class HttpBoundProtocolPayloadGenerator(
     private val smithyEventStream = RuntimeType.smithyEventStream(runtimeConfig)
     private val codegenScope =
         arrayOf(
-            "hyper" to CargoDependency.HyperWithStream.toType(),
             "SdkBody" to RuntimeType.sdkBody(runtimeConfig),
             "BuildError" to runtimeConfig.operationBuildError(),
-            "SmithyHttp" to smithyHttpType,
+            "SmithyHttp" to RuntimeType.smithyHttp(runtimeConfig),
             "NoOpSigner" to smithyEventStream.resolve("frame::NoOpSigner"),
             *RuntimeType.preludeScope,
         )
@@ -265,7 +262,6 @@ class HttpBoundProtocolPayloadGenerator(
                 unionShape,
                 serializerGenerator,
                 payloadContentType,
-                smithyHttpType,
             ).render()
 
         val eventStreamMarshallerGenerator =

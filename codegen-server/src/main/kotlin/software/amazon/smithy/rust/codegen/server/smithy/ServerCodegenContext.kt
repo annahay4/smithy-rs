@@ -42,18 +42,4 @@ data class ServerCodegenContext(
     override fun builderInstantiator(): BuilderInstantiator {
         return ServerBuilderInstantiator(symbolProvider, returnSymbolToParseFn(this))
     }
-
-    fun isHttp1() = settings.codegenConfig.http1x
-
-    /**
-     * Returns the appropriate HTTP dependencies based on the http-1x configuration.
-     *
-     * This is the single source of truth for HTTP dependency selection. When http-1x
-     * is enabled, all HTTP dependencies are upgraded together to maintain compatibility.
-     */
-    private val httpDependencies by lazy {
-        HttpDependencies.create(settings.codegenConfig.http1x, runtimeConfig)
-    }
-
-    fun httpDependencies(): HttpDependencies = httpDependencies
 }

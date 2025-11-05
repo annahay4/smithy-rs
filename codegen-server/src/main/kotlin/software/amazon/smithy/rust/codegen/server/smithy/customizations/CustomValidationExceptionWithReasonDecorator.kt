@@ -89,7 +89,7 @@ class ValidationExceptionWithReasonConversionGenerator(private val codegenContex
                     }
                 }
                 """,
-                "RequestRejection" to protocol.requestRejection(codegenContext.httpDependencies().smithyHttpServer),
+                "RequestRejection" to protocol.requestRejection(codegenContext.runtimeConfig),
                 "From" to RuntimeType.From,
             )
         }

@@ -22,18 +22,20 @@ import software.amazon.smithy.rust.codegen.core.rustlang.plus
 import software.amazon.smithy.rust.codegen.core.rustlang.rust
 import software.amazon.smithy.rust.codegen.core.rustlang.rustTemplate
 import software.amazon.smithy.rust.codegen.core.rustlang.writable
+import software.amazon.smithy.rust.codegen.core.smithy.RuntimeConfig
 import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
 import software.amazon.smithy.rust.codegen.core.util.dq
 import software.amazon.smithy.rust.codegen.core.util.getTrait
 import software.amazon.smithy.rust.codegen.core.util.hasTrait
 import software.amazon.smithy.rust.codegen.core.util.orNull
+import software.amazon.smithy.rust.codegen.server.smithy.ServerCargoDependency
 import java.util.Optional
 
 /** Models the ways status codes can be bound and sensitive. */
-class StatusCodeSensitivity(private val sensitive: Boolean, private val smithyHttpServer: RuntimeType) {
+class StatusCodeSensitivity(private val sensitive: Boolean, runtimeConfig: RuntimeConfig) {
     private val codegenScope =
         arrayOf(
-            "SmithyHttpServer" to smithyHttpServer,
+            "SmithyHttpServer" to ServerCargoDependency.smithyHttpServer(runtimeConfig).toType(),
         )
 
     /** Returns the type of the `MakeFmt`. */
@@ -64,9 +66,9 @@ data class GreedyLabel(
 )
 
 /** Models the ways labels can be bound and sensitive. */
-class LabelSensitivity(internal val labelIndexes: List<Int>, internal val greedyLabel: GreedyLabel?, private val smithyHttpServer: RuntimeType) {
+class LabelSensitivity(internal val labelIndexes: List<Int>, internal val greedyLabel: GreedyLabel?, runtimeConfig: RuntimeConfig) {
     private val codegenScope =
-        arrayOf("SmithyHttpServer" to smithyHttpServer)
+        arrayOf("SmithyHttpServer" to ServerCargoDependency.smithyHttpServer(runtimeConfig).toType())
 
     /** Returns the closure used during construction. */
     fun closure(): Writable =
@@ -128,13 +130,12 @@ class LabelSensitivity(internal val labelIndexes: List<Int>, internal val greedy
 sealed class HeaderSensitivity(
     /** The values of the sensitive `httpHeaders`. */
     val headerKeys: List<String>,
-    smithyHttpServer: RuntimeType,
-    httpRuntimeType: RuntimeType = RuntimeType.Http,
+    runtimeConfig: RuntimeConfig,
 ) {
     private val codegenScope =
         arrayOf(
-            "SmithyHttpServer" to smithyHttpServer,
-            "Http" to httpRuntimeType,
+            "SmithyHttpServer" to ServerCargoDependency.smithyHttpServer(runtimeConfig).toType(),
+            "Http" to RuntimeType.httpForConfig(runtimeConfig),
         )
 
     /** The case where `prefixHeaders` value is not sensitive. */
@@ -142,9 +143,8 @@ sealed class HeaderSensitivity(
         headerKeys: List<String>,
         /** The value of `prefixHeaders`, null if it's not sensitive. */
         val prefixHeader: String?,
-        smithyHttpServer: RuntimeType,
-        httpRuntimeType: RuntimeType = RuntimeType.Http,
-    ) : HeaderSensitivity(headerKeys, smithyHttpServer, httpRuntimeType)
+        runtimeConfig: RuntimeConfig,
+    ) : HeaderSensitivity(headerKeys, runtimeConfig)
 
     /** The case where `prefixHeaders` value is sensitive. */
     class SensitiveMapValue(
@@ -153,9 +153,8 @@ sealed class HeaderSensitivity(
         val keySensitive: Boolean,
         /** The value of `prefixHeaders`. */
         val prefixHeader: String,
-        smithyHttpServer: RuntimeType,
-        httpRuntimeType: RuntimeType = RuntimeType.Http,
-    ) : HeaderSensitivity(headerKeys, smithyHttpServer, httpRuntimeType)
+        runtimeConfig: RuntimeConfig,
+    ) : HeaderSensitivity(headerKeys, runtimeConfig)
 
     /** Is there anything to redact? */
     internal fun hasRedactions(): Boolean =
@@ -246,20 +245,20 @@ sealed class HeaderSensitivity(
 sealed class QuerySensitivity(
     /** Are all keys sensitive? */
     val allKeysSensitive: Boolean,
-    smithyHttpServer: RuntimeType,
+    runtimeConfig: RuntimeConfig,
 ) {
     private val codegenScope =
-        arrayOf("SmithyHttpServer" to smithyHttpServer)
+        arrayOf("SmithyHttpServer" to ServerCargoDependency.smithyHttpServer(runtimeConfig).toType())
 
     /** The case where the `httpQueryParams` value is not sensitive. */
     class NotSensitiveMapValue(
         /** The values of `httpQuery`. */
         val queryKeys: List<String>,
-        allKeysSensitive: Boolean, smithyHttpServer: RuntimeType,
-    ) : QuerySensitivity(allKeysSensitive, smithyHttpServer)
+        allKeysSensitive: Boolean, runtimeConfig: RuntimeConfig,
+    ) : QuerySensitivity(allKeysSensitive, runtimeConfig)
 
     /** The case where `httpQueryParams` value is sensitive. */
-    class SensitiveMapValue(allKeysSensitive: Boolean, smithyHttpServer: RuntimeType) : QuerySensitivity(allKeysSensitive, smithyHttpServer)
+    class SensitiveMapValue(allKeysSensitive: Boolean, runtimeConfig: RuntimeConfig) : QuerySensitivity(allKeysSensitive, runtimeConfig)
 
     /** Is there anything to redact? */
     internal fun hasRedactions(): Boolean =
@@ -344,13 +343,12 @@ data class MakeFmt(
 class ServerHttpSensitivityGenerator(
     private val model: Model,
     private val operation: OperationShape,
-    private val smithyHttpServer: RuntimeType,
-    private val httpRuntimeType: RuntimeType = RuntimeType.Http,
+    private val runtimeConfig: RuntimeConfig,
 ) {
     private val codegenScope =
         arrayOf(
-            "SmithyHttpServer" to smithyHttpServer,
-            "Http" to httpRuntimeType,
+            "SmithyHttpServer" to ServerCargoDependency.smithyHttpServer(runtimeConfig).toType(),
+            "Http" to RuntimeType.httpForConfig(runtimeConfig),
         )
 
     /** Constructs `StatusCodeSensitivity` of a `Shape` */
@@ -365,7 +363,7 @@ class ServerHttpSensitivityGenerator(
                 .filter { it.hasTrait<HttpHeaderTrait>() }
                 .any { rootSensitive || it.getMemberTrait(model, SensitiveTrait::class.java).isPresent }
 
-        return StatusCodeSensitivity(isSensitive, smithyHttpServer)
+        return StatusCodeSensitivity(isSensitive, runtimeConfig)
     }
 
     /** Constructs `HeaderSensitivity` of a `Shape` */
@@ -382,7 +380,7 @@ class ServerHttpSensitivityGenerator(
             if (prefixHeader != null) {
                 return HeaderSensitivity.SensitiveMapValue(
                     headerKeys.map { it.second }, true,
-                    prefixHeader.second, smithyHttpServer, httpRuntimeType,
+                    prefixHeader.second, runtimeConfig,
                 )
             }
         }
@@ -402,14 +400,14 @@ class ServerHttpSensitivityGenerator(
             val isValueSensitive = prefixHeaderMap?.value?.getMemberTrait(model, SensitiveTrait::class.java)?.orNull() != null
 
             if (isValueSensitive) {
-                HeaderSensitivity.SensitiveMapValue(sensitiveHeaders, isKeySensitive, prefixHeader.second, smithyHttpServer, httpRuntimeType)
+                HeaderSensitivity.SensitiveMapValue(sensitiveHeaders, isKeySensitive, prefixHeader.second, runtimeConfig)
             } else if (isKeySensitive) {
-                HeaderSensitivity.NotSensitiveMapValue(sensitiveHeaders, prefixHeader.second, smithyHttpServer, httpRuntimeType)
+                HeaderSensitivity.NotSensitiveMapValue(sensitiveHeaders, prefixHeader.second, runtimeConfig)
             } else {
-                HeaderSensitivity.NotSensitiveMapValue(sensitiveHeaders, null, smithyHttpServer, httpRuntimeType)
+                HeaderSensitivity.NotSensitiveMapValue(sensitiveHeaders, null, runtimeConfig)
             }
         } else {
-            HeaderSensitivity.NotSensitiveMapValue(sensitiveHeaders, null, smithyHttpServer, httpRuntimeType)
+            HeaderSensitivity.NotSensitiveMapValue(sensitiveHeaders, null, runtimeConfig)
         }
     }
 
@@ -422,7 +420,7 @@ class ServerHttpSensitivityGenerator(
         val rootSensitive = rootShape.hasTrait<SensitiveTrait>()
         if (rootSensitive) {
             if (queryParams != null) {
-                return QuerySensitivity.SensitiveMapValue(true, smithyHttpServer)
+                return QuerySensitivity.SensitiveMapValue(true, runtimeConfig)
             }
         }
 
@@ -444,12 +442,12 @@ class ServerHttpSensitivityGenerator(
             val isValueSensitive = queryParamsMap?.value?.getMemberTrait(model, SensitiveTrait::class.java)?.orNull() != null
 
             if (isValueSensitive) {
-                QuerySensitivity.SensitiveMapValue(isKeySensitive, smithyHttpServer)
+                QuerySensitivity.SensitiveMapValue(isKeySensitive, runtimeConfig)
             } else {
-                QuerySensitivity.NotSensitiveMapValue(sensitiveQueries, isKeySensitive, smithyHttpServer)
+                QuerySensitivity.NotSensitiveMapValue(sensitiveQueries, isKeySensitive, runtimeConfig)
             }
         } else {
-            QuerySensitivity.NotSensitiveMapValue(sensitiveQueries, false, smithyHttpServer)
+            QuerySensitivity.NotSensitiveMapValue(sensitiveQueries, false, runtimeConfig)
         }
     }
 
@@ -497,7 +495,7 @@ class ServerHttpSensitivityGenerator(
                     GreedyLabel(index, remainder)
                 }
 
-        return LabelSensitivity(labelIndexes, greedyLabel, smithyHttpServer)
+        return LabelSensitivity(labelIndexes, greedyLabel, runtimeConfig)
     }
 
     private fun getShape(shape: Optional<ShapeId>): Shape? {

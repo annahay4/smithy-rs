@@ -44,8 +44,6 @@ class ServerResponseBindingGenerator(
                     codegenContext,
                 ),
             ),
-            httpRuntimeType = codegenContext.httpDependencies().httpType(),
-            smithyHttpRuntimeType = codegenContext.httpDependencies().smithyHttpModule(),
         )
 
     fun generateAddHeadersFn(shape: Shape): RuntimeType? =

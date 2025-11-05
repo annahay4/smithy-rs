@@ -34,14 +34,8 @@ internal class Http1xDependencyTest {
     private val cargoMetadata = CargoDependency("cargo_metadata", CratesIo("0.18"), features = setOf("builder")).toType()
     private val semver = CargoDependency("semver", CratesIo("1.0")).toType()
 
-    private fun buildAdditionalSettings(
-        http1x: Boolean?,
-        publicConstrainedTypes: Boolean,
-    ): ObjectNode {
+    private fun buildAdditionalSettings(publicConstrainedTypes: Boolean): ObjectNode {
         val builder = ServerAdditionalSettings.builder()
-        if (http1x != null) {
-            builder.withHttp1x(http1x)
-        }
         return builder
             .publicConstrainedTypes(publicConstrainedTypes)
             .generateCodegenComments(true)
@@ -224,7 +218,7 @@ internal class Http1xDependencyTest {
         serverIntegrationTest(
             model,
             IntegrationTestParams(
-                additionalSettings = buildAdditionalSettings(http1x = true, publicConstrainedTypes),
+                additionalSettings = buildAdditionalSettings(publicConstrainedTypes),
                 cargoCommand = "cargo test --all-features",
             ),
             testCoverage = HttpTestType.HTTP_1_ONLY,
@@ -278,7 +272,7 @@ internal class Http1xDependencyTest {
         serverIntegrationTest(
             model,
             IntegrationTestParams(
-                additionalSettings = buildAdditionalSettings(http1x = null, publicConstrainedTypes = false),
+                additionalSettings = buildAdditionalSettings(publicConstrainedTypes = false),
                 cargoCommand = "cargo test --all-features",
             ),
             testCoverage = HttpTestType.AS_CONFIGURED,
@@ -299,7 +293,7 @@ internal class Http1xDependencyTest {
         serverIntegrationTest(
             model,
             IntegrationTestParams(
-                additionalSettings = buildAdditionalSettings(http1x = true, publicConstrainedTypes = false),
+                additionalSettings = buildAdditionalSettings(publicConstrainedTypes = false),
                 cargoCommand = "cargo test --all-features",
             ),
             testCoverage = HttpTestType.HTTP_1_ONLY,
@@ -352,7 +346,7 @@ internal class Http1xDependencyTest {
         serverIntegrationTest(
             model,
             IntegrationTestParams(
-                additionalSettings = buildAdditionalSettings(http1x = null, publicConstrainedTypes = false),
+                additionalSettings = buildAdditionalSettings(publicConstrainedTypes = false),
                 cargoCommand = "cargo test --all-features",
             ),
             testCoverage = HttpTestType.AS_CONFIGURED,
@@ -417,7 +411,7 @@ internal class Http1xDependencyTest {
         serverIntegrationTest(
             model,
             IntegrationTestParams(
-                additionalSettings = buildAdditionalSettings(http1x = false, publicConstrainedTypes = false),
+                additionalSettings = buildAdditionalSettings(publicConstrainedTypes = false),
                 cargoCommand = "cargo test --all-features",
             ),
             testCoverage = HttpTestType.HTTP_0_ONLY,
@@ -437,7 +431,7 @@ internal class Http1xDependencyTest {
         fun protocolAndConstrainedTypesProvider(): List<Arguments> {
             // Constraints are not implemented for RestXML protocol.
             val protocols =
-                ModelProtocol.values().filter {
+                ModelProtocol.entries.filter {
                     !it.name.matches(Regex("RestXml.*"))
                 }
             val constrainedSettings = listOf(true, false)

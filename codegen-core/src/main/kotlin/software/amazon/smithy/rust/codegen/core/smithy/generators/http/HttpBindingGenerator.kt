@@ -26,7 +26,6 @@ import software.amazon.smithy.model.shapes.UnionShape
 import software.amazon.smithy.model.traits.EnumTrait
 import software.amazon.smithy.model.traits.MediaTypeTrait
 import software.amazon.smithy.model.traits.TimestampFormatTrait
-import software.amazon.smithy.rust.codegen.core.rustlang.CargoDependency
 import software.amazon.smithy.rust.codegen.core.rustlang.RustType
 import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
 import software.amazon.smithy.rust.codegen.core.rustlang.Writable
@@ -125,14 +124,12 @@ class HttpBindingGenerator(
     private val symbolProvider: SymbolProvider,
     private val operationShape: OperationShape,
     private val customizations: List<HttpBindingCustomization> = listOf(),
-    private val httpRuntimeType: RuntimeType = RuntimeType.Http1x,
-    private val smithyHttpRuntimeType: RuntimeType = RuntimeType.smithyHttp(codegenContext.runtimeConfig),
 ) {
     private val runtimeConfig = codegenContext.runtimeConfig
     private val codegenTarget = codegenContext.target
     private val model = codegenContext.model
     private val index = HttpBindingIndex.of(model)
-    private val headerUtil = smithyHttpRuntimeType.resolve("header")
+    private val headerUtil = RuntimeType.smithyHttp(runtimeConfig).resolve("header")
     private val defaultTimestampFormat = TimestampFormatTrait.Format.EPOCH_SECONDS
     private val protocolFunctions = ProtocolFunctions(codegenContext)
     private val serializerUtil = SerializerUtil(model, symbolProvider)
@@ -271,7 +268,6 @@ class HttpBindingGenerator(
                 codegenContext,
                 operationShape,
                 targetShape,
-                smithyHttpRuntimeType.dependency!! as CargoDependency,
             ).render()
         rustTemplate(
             """
@@ -289,7 +285,7 @@ class HttpBindingGenerator(
                         rustTemplate(
                             "#{EventReceiver}::new(#{Receiver}::new(unmarshaller, body))",
                             "EventReceiver" to RuntimeType.eventReceiver(runtimeConfig),
-                            "Receiver" to smithyHttpRuntimeType.resolve("event_stream::Receiver"),
+                            "Receiver" to RuntimeType.eventStreamReceiver(runtimeConfig),
                         )
                     }
                 },
@@ -539,8 +535,8 @@ class HttpBindingGenerator(
             val codegenScope =
                 arrayOf(
                     "BuildError" to runtimeConfig.operationBuildError(),
-                    HttpMessageType.REQUEST.name to httpRuntimeType.resolve("request::Builder"),
-                    HttpMessageType.RESPONSE.name to httpRuntimeType.resolve("response::Builder"),
+                    HttpMessageType.REQUEST.name to RuntimeType.httpRequestBuilderForConfig(runtimeConfig),
+                    HttpMessageType.RESPONSE.name to RuntimeType.httpResponseBuilderForConfig(runtimeConfig),
                     "Shape" to shapeSymbol,
                 )
             rustBlockTemplate(
@@ -716,7 +712,7 @@ class HttpBindingGenerator(
                     builder = builder.header("$headerName", header_value);
 
                     """,
-                    "HeaderValue" to httpRuntimeType.resolve("HeaderValue"),
+                    "HeaderValue" to RuntimeType.httpForConfig(runtimeConfig).resolve("HeaderValue"),
                     "invalid_field_error" to renderErrorMessage("header_value"),
                 )
             }
@@ -771,8 +767,8 @@ class HttpBindingGenerator(
                 }
 
                 """,
-                "HeaderValue" to httpRuntimeType.resolve("HeaderValue"),
-                "HeaderName" to httpRuntimeType.resolve("HeaderName"),
+                "HeaderValue" to RuntimeType.httpForConfig(runtimeConfig).resolve("HeaderValue"),
+                "HeaderName" to RuntimeType.httpForConfig(runtimeConfig).resolve("HeaderName"),
                 "invalid_header_name" to
                     OperationBuildError(runtimeConfig).invalidField(memberName) {
                         rust("""format!("`{k}` cannot be used as a header name: {err}")""")

@@ -19,6 +19,7 @@ import software.amazon.smithy.protocoltests.traits.HttpMalformedResponseBodyDefi
 import software.amazon.smithy.protocoltests.traits.HttpMalformedResponseDefinition
 import software.amazon.smithy.protocoltests.traits.HttpRequestTestCase
 import software.amazon.smithy.protocoltests.traits.HttpResponseTestCase
+import software.amazon.smithy.rust.codegen.core.rustlang.CargoDependency
 import software.amazon.smithy.rust.codegen.core.rustlang.RustReservedWords
 import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
 import software.amazon.smithy.rust.codegen.core.rustlang.Writable
@@ -29,6 +30,7 @@ import software.amazon.smithy.rust.codegen.core.rustlang.rustTemplate
 import software.amazon.smithy.rust.codegen.core.rustlang.withBlock
 import software.amazon.smithy.rust.codegen.core.rustlang.writable
 import software.amazon.smithy.rust.codegen.core.smithy.CodegenContext
+import software.amazon.smithy.rust.codegen.core.smithy.HttpVersion
 import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
 import software.amazon.smithy.rust.codegen.core.smithy.generators.protocol.BrokenTest
 import software.amazon.smithy.rust.codegen.core.smithy.generators.protocol.FailingTest
@@ -52,7 +54,6 @@ import software.amazon.smithy.rust.codegen.core.util.outputShape
 import software.amazon.smithy.rust.codegen.core.util.toPascalCase
 import software.amazon.smithy.rust.codegen.core.util.toSnakeCase
 import software.amazon.smithy.rust.codegen.server.smithy.ServerCargoDependency
-import software.amazon.smithy.rust.codegen.server.smithy.ServerCodegenContext
 import software.amazon.smithy.rust.codegen.server.smithy.generators.ServerInstantiator
 import java.util.logging.Logger
 
@@ -282,25 +283,33 @@ class ServerProtocolTestGenerator(
 
     private val instantiator = ServerInstantiator(codegenContext, withinTest = true)
 
-    private val serverCodegenContext = codegenContext as software.amazon.smithy.rust.codegen.server.smithy.ServerCodegenContext
-    private val httpDeps = serverCodegenContext.httpDependencies()
-    private val isHttp1 = serverCodegenContext.isHttp1()
+    /**
+     * Returns the protocol test dependency with the correct HTTP version feature.
+     * For HTTP 0.x: uses http-02x feature (default).
+     * For HTTP 1.x: uses http-1x feature.
+     */
+    private val protocolTestRuntimeType =
+        when (codegenContext.runtimeConfig.httpVersion) {
+            HttpVersion.Http1x ->
+                CargoDependency.smithyProtocolTestHelpers(codegenContext.runtimeConfig)
+                    .withFeature("http-1x")
+                    .toType()
 
-    private val protocolTestRuntimeType = httpDeps.protocolTestDependency(codegenContext.runtimeConfig).toType()
+            HttpVersion.Http0x ->
+                CargoDependency.smithyProtocolTestHelpers(codegenContext.runtimeConfig).toType()
+        }
 
     private val codegenScope =
         arrayOf(
             "AssertEq" to RuntimeType.PrettyAssertions.resolve("assert_eq!"),
             "Base64SimdDev" to ServerCargoDependency.Base64SimdDev.toType(),
             "Bytes" to RuntimeType.Bytes,
-            "Hyper" to httpDeps.hyperModule(),
-            "HttpRequest" to httpDeps.httpRequest(),
-            "HttpStatusCode" to httpDeps.httpModule().resolve("StatusCode"),
+            "Http" to RuntimeType.httpForConfig(codegenContext.runtimeConfig),
+            "Hyper" to RuntimeType.hyperForConfig(codegenContext.runtimeConfig),
             "MediaType" to protocolTestRuntimeType.resolve("MediaType"),
             "Tokio" to ServerCargoDependency.TokioDev.toType(),
             "Tower" to RuntimeType.Tower,
-            "SmithyHttpServer" to httpDeps.smithyHttpServer.toType(),
-            "ServiceBuilderBodyType" to httpDeps.serviceBuilderBodyType(),
+            "SmithyHttpServer" to ServerCargoDependency.smithyHttpServer(codegenContext.runtimeConfig).toType(),
             "decode_body_data" to protocolTestRuntimeType.resolve("decode_body_data"),
         )
 
@@ -329,10 +338,6 @@ class ServerProtocolTestGenerator(
             return
         }
 
-        // Check if this operation has streaming members to determine body type
-        val inputShape = operationShape.inputShape(model)
-        val needsSync = inputShape.hasStreamingMember(model)
-
         with(httpRequestTestCase) {
             renderHttpRequest(
                 uri,
@@ -342,7 +347,6 @@ class ServerProtocolTestGenerator(
                 bodyMediaType.orNull(),
                 queryParams,
                 host.orNull(),
-                needsSync,
             )
         }
         if (protocolSupport.requestBodyDeserialization) {
@@ -411,10 +415,6 @@ class ServerProtocolTestGenerator(
 
         val panicMessage = "request should have been rejected, but we accepted it; we parsed operation input `{:?}`"
 
-        // Check if this operation has streaming members to determine body type
-        val inputShape = operationShape.inputShape(model)
-        val needsSync = inputShape.hasStreamingMember(model)
-
         rustBlock("") {
             with(testCase.request) {
                 // TODO(https://github.com/awslabs/smithy/issues/1102): `uri` should probably not be an `Optional`.
@@ -426,7 +426,6 @@ class ServerProtocolTestGenerator(
                     bodyMediaType.orNull(),
                     queryParams,
                     host.orNull(),
-                    needsSync,
                 )
             }
 
@@ -448,12 +447,11 @@ class ServerProtocolTestGenerator(
         bodyMediaType: String?,
         queryParams: List<String>,
         host: String?,
-        needsSync: Boolean = false,
     ) {
         rustTemplate(
             """
             ##[allow(unused_mut)]
-            let mut http_request = #{HttpRequest}::builder()
+            let mut http_request = #{Http}::Request::builder()
                 .uri("$uri")
                 .method("$method")
             """,
@@ -462,6 +460,10 @@ class ServerProtocolTestGenerator(
         for (header in headers) {
             rust(".header(${header.key.dq()}, ${header.value.dq()})")
         }
+
+        // Determine if we need Sync bounds for the body (streaming operations)
+        val needsSync = operationShape.inputShape(model).hasStreamingMember(model)
+
         val bodyCode =
             if (body != null) {
                 // The `replace` is necessary to fix the malformed request test `RestJsonInvalidJsonBody`.
@@ -510,14 +512,15 @@ class ServerProtocolTestGenerator(
      * @param bytesExpr Expression for the bytes to put in the body, or null for empty body
      * @param needsSync If true, uses boxed_sync for operations that require Sync bounds
      */
-    fun requestBodyConstructor(
+    private fun requestBodyConstructor(
         bytesExpr: String?,
         needsSync: Boolean = false,
     ) = writable {
-        val serverCrate = httpDeps.smithyHttpServer.toType()
+        val runtimeConfig = codegenContext.runtimeConfig
+        val serverCrate = ServerCargoDependency.smithyHttpServer(runtimeConfig).toType()
 
-        if (isHttp1) {
-            val bodyUtil = httpDeps.httpBodyUtil!!.toType()
+        if (runtimeConfig.httpVersion == software.amazon.smithy.rust.codegen.core.smithy.HttpVersion.Http1x) {
+            val bodyUtil = software.amazon.smithy.rust.codegen.core.rustlang.CargoDependency.HttpBodyUtil01x.toType()
 
             val boxFn = if (needsSync) "boxed_sync" else "boxed"
             if (bytesExpr != null) {
@@ -590,10 +593,8 @@ class ServerProtocolTestGenerator(
         val (inputT, _) = operationInputOutputTypes[operationShape]!!
         val operationName = RustReservedWords.escapeIfNeeded(operationSymbol.name.toSnakeCase())
 
-        // Determine if this operation needs Sync (has streaming members)
         val inputShape = operationShape.inputShape(model)
         val needsSync = inputShape.hasStreamingMember(model)
-        val bodyType = httpDeps.serviceBuilderBodyType(needsSync)
 
         rustWriter.rustTemplate(
             """
@@ -615,7 +616,7 @@ class ServerProtocolTestGenerator(
                 .expect("unable to make an HTTP request");
             """,
             "Body" to body,
-            "BodyType" to bodyType,
+            "BodyType" to serviceBuilderBodyType(needsSync),
             *codegenScope,
         )
     }
@@ -753,33 +754,61 @@ class ServerProtocolTestGenerator(
         }
     }
 
+    /**
+     * Returns the body type to use for service builder in protocol tests.
+     * For HTTP 0.x: uses hyper::body::Body (concrete type).
+     * For HTTP 1.x: uses smithy BoxBody (no Sync requirement for protocol tests).
+     */
+    private fun serviceBuilderBodyType(needsSync: Boolean): RuntimeType =
+        when (codegenContext.runtimeConfig.httpVersion) {
+            HttpVersion.Http1x ->
+                // HTTP 1.x: use BoxBodySync for streaming operations that need Sync
+                if (needsSync) {
+                    ServerCargoDependency.smithyHttpServer(codegenContext.runtimeConfig).toType().resolve("body::BoxBodySync")
+                } else {
+                    ServerCargoDependency.smithyHttpServer(codegenContext.runtimeConfig).toType().resolve("body::BoxBody")
+                }
+
+            HttpVersion.Http0x ->
+                // HTTP 0.x: use hyper::body::Body (concrete type)
+                RuntimeType.Hyper.resolve("body::Body")
+        }
+
+    /**
+     * Returns a Writable that generates version-appropriate code for reading HTTP response body to bytes.
+     * For HTTP 1.x: Uses http_body_util::BodyExt::collect()
+     * For HTTP 0.x: Uses hyper::body::to_bytes()
+     *
+     * @param responseVarName The name of the HTTP response variable (e.g., "http_response")
+     */
+    private fun httpBodyToBytes(): Writable =
+        writable {
+            when (codegenContext.runtimeConfig.httpVersion) {
+                HttpVersion.Http1x ->
+                    rustTemplate(
+                        """
+                        use #{HttpBodyUtil}::BodyExt;
+                        let body = http_response.into_body().collect().await.expect("unable to collect body").to_bytes();
+                        """,
+                        "HttpBodyUtil" to CargoDependency.HttpBodyUtil01x.toType(),
+                    )
+
+                HttpVersion.Http0x ->
+                    rustTemplate(
+                        """
+                        let body = #{Hyper}::body::to_bytes(http_response.into_body()).await.expect("unable to extract body to bytes");
+                        """,
+                        "Hyper" to RuntimeType.Hyper,
+                    )
+            }
+        }
+
     private fun checkBody(
         rustWriter: RustWriter,
         body: String,
         mediaType: String?,
     ) {
-        // Generate different body collection code based on HTTP version
-        if (serverCodegenContext.isHttp1()) {
-            // For HTTP 1.x: use http-body-util's BodyExt trait
-            rustWriter.rustTemplate(
-                """
-                let body = {
-                    use #{HttpBodyUtil}::BodyExt;
-                    http_response.into_body().collect().await.expect("unable to collect body").to_bytes()
-                };
-                """,
-                *codegenScope,
-                "HttpBodyUtil" to httpDeps.httpBodyUtil!!.toType(),
-            )
-        } else {
-            // For HTTP 0.x: use hyper's to_bytes
-            rustWriter.rustTemplate(
-                """
-                let body = #{Hyper}::body::to_bytes(http_response.into_body()).await.expect("unable to extract body to bytes");
-                """,
-                *codegenScope,
-            )
-        }
+        httpBodyToBytes().invoke(rustWriter)
         if (body == "") {
             rustWriter.rustTemplate(
                 """
@@ -808,7 +837,7 @@ class ServerProtocolTestGenerator(
         rustWriter.rustTemplate(
             """
             #{AssertEq}(
-                #{HttpStatusCode}::from_u16($statusCode).expect("invalid expected HTTP status code"),
+                #{Http}::StatusCode::from_u16($statusCode).expect("invalid expected HTTP status code"),
                 http_response.status()
             );
             """,

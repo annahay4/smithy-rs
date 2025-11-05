@@ -23,7 +23,7 @@ import software.amazon.smithy.rust.codegen.core.util.hasEventStreamOperations
 import software.amazon.smithy.rust.codegen.core.util.hasStreamingMember
 
 /** Returns true if the model has normal streaming operations (excluding event streams) */
-fun hasStreamingOperations(
+private fun hasStreamingOperations(
     model: Model,
     serviceShape: ServiceShape,
 ): Boolean {
@@ -49,10 +49,10 @@ private fun structUnionMembersMatchPredicate(
         }
 
 /** Returns true if the model uses any blob shapes */
-fun hasBlobs(model: Model): Boolean = structUnionMembersMatchPredicate(model, Shape::isBlobShape)
+private fun hasBlobs(model: Model): Boolean = structUnionMembersMatchPredicate(model, Shape::isBlobShape)
 
 /** Returns true if the model uses any timestamp shapes */
-fun hasDateTimes(model: Model): Boolean = structUnionMembersMatchPredicate(model, Shape::isTimestampShape)
+private fun hasDateTimes(model: Model): Boolean = structUnionMembersMatchPredicate(model, Shape::isTimestampShape)
 
 /** Adds re-export statements for Smithy primitives */
 fun pubUseSmithyPrimitives(

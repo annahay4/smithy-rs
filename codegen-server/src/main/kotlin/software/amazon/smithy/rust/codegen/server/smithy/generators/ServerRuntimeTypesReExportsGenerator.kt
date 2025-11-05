@@ -8,14 +8,15 @@ package software.amazon.smithy.rust.codegen.server.smithy.generators
 import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
 import software.amazon.smithy.rust.codegen.core.rustlang.rustTemplate
 import software.amazon.smithy.rust.codegen.core.smithy.CodegenContext
+import software.amazon.smithy.rust.codegen.server.smithy.ServerCargoDependency
 
 class ServerRuntimeTypesReExportsGenerator(
     codegenContext: CodegenContext,
 ) {
-    private val serverCodegenContext = codegenContext as software.amazon.smithy.rust.codegen.server.smithy.ServerCodegenContext
+    private val runtimeConfig = codegenContext.runtimeConfig
     private val codegenScope =
         arrayOf(
-            "SmithyHttpServer" to serverCodegenContext.httpDependencies().smithyHttpServer.toType(),
+            "SmithyHttpServer" to ServerCargoDependency.smithyHttpServer(runtimeConfig).toType(),
         )
 
     fun render(writer: RustWriter) {

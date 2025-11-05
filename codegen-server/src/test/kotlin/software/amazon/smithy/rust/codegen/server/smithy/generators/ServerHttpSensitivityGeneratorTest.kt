@@ -6,13 +6,10 @@
 package software.amazon.smithy.rust.codegen.server.smithy.generators
 
 import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.params.ParameterizedTest
-import org.junit.jupiter.params.provider.Arguments
-import org.junit.jupiter.params.provider.MethodSource
+import org.junit.jupiter.api.Test
 import software.amazon.smithy.model.traits.HttpTrait
+import software.amazon.smithy.rust.codegen.core.rustlang.CargoDependency
 import software.amazon.smithy.rust.codegen.core.rustlang.rustTemplate
-import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
-import software.amazon.smithy.rust.codegen.core.testutil.TestRuntimeConfig
 import software.amazon.smithy.rust.codegen.core.testutil.TestWorkspace
 import software.amazon.smithy.rust.codegen.core.testutil.asSmithyModel
 import software.amazon.smithy.rust.codegen.core.testutil.compileAndTest
@@ -20,38 +17,19 @@ import software.amazon.smithy.rust.codegen.core.testutil.testModule
 import software.amazon.smithy.rust.codegen.core.testutil.unitTest
 import software.amazon.smithy.rust.codegen.core.util.getTrait
 import software.amazon.smithy.rust.codegen.core.util.inputShape
-import software.amazon.smithy.rust.codegen.server.smithy.HttpDependencies
+import software.amazon.smithy.rust.codegen.server.smithy.ServerCargoDependency
+import software.amazon.smithy.rust.codegen.server.smithy.testutil.ServerTestRuntimeConfig
 import software.amazon.smithy.rust.codegen.server.smithy.testutil.serverTestSymbolProvider
-import java.util.stream.Stream
 
 class ServerHttpSensitivityGeneratorTest {
-    companion object {
-        @JvmStatic
-        fun httpVersions(): Stream<Arguments> =
-            Stream.of(
-                Arguments.of(false, "HTTP 0.x"),
-                Arguments.of(true, "HTTP 1.x"),
-            )
+    private val codegenScope =
+        arrayOf(
+            "SmithyHttpServer" to ServerCargoDependency.smithyHttpServer(ServerTestRuntimeConfig).toType(),
+            "Http" to CargoDependency.Http.toType(),
+        )
 
-        private fun getDependencies(http1x: Boolean): Pair<RuntimeType, RuntimeType> {
-            val httpDeps = HttpDependencies.create(http1x, TestRuntimeConfig)
-            return httpDeps.smithyHttpServer.toType() to httpDeps.http.toType()
-        }
-    }
-
-    @ParameterizedTest(name = "{1}")
-    @MethodSource("httpVersions")
-    fun `query closure`(
-        http1x: Boolean,
-        @Suppress("UNUSED_PARAMETER") displayName: String,
-    ) {
-        val (smithyHttpServerType, httpType) = getDependencies(http1x)
-        val codegenScope =
-            arrayOf(
-                "SmithyHttpServer" to smithyHttpServerType,
-                "Http" to httpType,
-            )
-
+    @Test
+    fun `query closure`() {
         val model =
             """
             namespace test
@@ -74,7 +52,7 @@ class ServerHttpSensitivityGeneratorTest {
             }
             """.asSmithyModel()
         val operation = model.operationShapes.toList()[0]
-        val generator = ServerHttpSensitivityGenerator(model, operation, smithyHttpServerType, httpType)
+        val generator = ServerHttpSensitivityGenerator(model, operation, ServerTestRuntimeConfig)
 
         val input = generator.input()!!
         val querySensitivity = generator.findQuerySensitivity(input)
@@ -99,19 +77,8 @@ class ServerHttpSensitivityGeneratorTest {
         testProject.compileAndTest()
     }
 
-    @ParameterizedTest(name = "{1}")
-    @MethodSource("httpVersions")
-    fun `query params closure`(
-        http1x: Boolean,
-        @Suppress("UNUSED_PARAMETER") displayName: String,
-    ) {
-        val (smithyHttpServerType, httpType) = getDependencies(http1x)
-        val codegenScope =
-            arrayOf(
-                "SmithyHttpServer" to smithyHttpServerType,
-                "Http" to httpType,
-            )
-
+    @Test
+    fun `query params closure`() {
         val model =
             """
             namespace test
@@ -133,7 +100,7 @@ class ServerHttpSensitivityGeneratorTest {
             }
             """.asSmithyModel()
         val operation = model.operationShapes.toList()[0]
-        val generator = ServerHttpSensitivityGenerator(model, operation, smithyHttpServerType, httpType)
+        val generator = ServerHttpSensitivityGenerator(model, operation, ServerTestRuntimeConfig)
 
         val input = generator.input()!!
         val querySensitivity = generator.findQuerySensitivity(input)
@@ -157,19 +124,8 @@ class ServerHttpSensitivityGeneratorTest {
         testProject.compileAndTest()
     }
 
-    @ParameterizedTest(name = "{1}")
-    @MethodSource("httpVersions")
-    fun `query params key closure`(
-        http1x: Boolean,
-        @Suppress("UNUSED_PARAMETER") displayName: String,
-    ) {
-        val (smithyHttpServerType, httpType) = getDependencies(http1x)
-        val codegenScope =
-            arrayOf(
-                "SmithyHttpServer" to smithyHttpServerType,
-                "Http" to httpType,
-            )
-
+    @Test
+    fun `query params key closure`() {
         val model =
             """
             namespace test
@@ -194,7 +150,7 @@ class ServerHttpSensitivityGeneratorTest {
 
             """.asSmithyModel()
         val operation = model.operationShapes.toList()[0]
-        val generator = ServerHttpSensitivityGenerator(model, operation, smithyHttpServerType, httpType)
+        val generator = ServerHttpSensitivityGenerator(model, operation, ServerTestRuntimeConfig)
 
         val input = generator.input()!!
         val querySensitivity = generator.findQuerySensitivity(input)
@@ -217,19 +173,8 @@ class ServerHttpSensitivityGeneratorTest {
         testProject.compileAndTest()
     }
 
-    @ParameterizedTest(name = "{1}")
-    @MethodSource("httpVersions")
-    fun `query params value closure`(
-        http1x: Boolean,
-        @Suppress("UNUSED_PARAMETER") displayName: String,
-    ) {
-        val (smithyHttpServerType, httpType) = getDependencies(http1x)
-        val codegenScope =
-            arrayOf(
-                "SmithyHttpServer" to smithyHttpServerType,
-                "Http" to httpType,
-            )
-
+    @Test
+    fun `query params value closure`() {
         val model =
             """
             namespace test
@@ -254,7 +199,7 @@ class ServerHttpSensitivityGeneratorTest {
 
             """.asSmithyModel()
         val operation = model.operationShapes.toList()[0]
-        val generator = ServerHttpSensitivityGenerator(model, operation, smithyHttpServerType, httpType)
+        val generator = ServerHttpSensitivityGenerator(model, operation, ServerTestRuntimeConfig)
 
         val input = generator.input()!!
         val querySensitivity = generator.findQuerySensitivity(input)
@@ -277,14 +222,8 @@ class ServerHttpSensitivityGeneratorTest {
         testProject.compileAndTest()
     }
 
-    @ParameterizedTest(name = "{1}")
-    @MethodSource("httpVersions")
-    fun `query params none`(
-        http1x: Boolean,
-        @Suppress("UNUSED_PARAMETER") displayName: String,
-    ) {
-        val (smithyHttpServerType, httpType) = getDependencies(http1x)
-
+    @Test
+    fun `query params none`() {
         val model =
             """
             namespace test
@@ -306,7 +245,7 @@ class ServerHttpSensitivityGeneratorTest {
 
             """.asSmithyModel()
         val operation = model.operationShapes.toList()[0]
-        val generator = ServerHttpSensitivityGenerator(model, operation, smithyHttpServerType, httpType)
+        val generator = ServerHttpSensitivityGenerator(model, operation, ServerTestRuntimeConfig)
 
         val input = generator.input()!!
         val querySensitivity = generator.findQuerySensitivity(input)
@@ -315,19 +254,8 @@ class ServerHttpSensitivityGeneratorTest {
         assert(!querySensitivity.hasRedactions())
     }
 
-    @ParameterizedTest(name = "{1}")
-    @MethodSource("httpVersions")
-    fun `header closure`(
-        http1x: Boolean,
-        @Suppress("UNUSED_PARAMETER") displayName: String,
-    ) {
-        val (smithyHttpServerType, httpType) = getDependencies(http1x)
-        val codegenScope =
-            arrayOf(
-                "SmithyHttpServer" to smithyHttpServerType,
-                "Http" to httpType,
-            )
-
+    @Test
+    fun `header closure`() {
         val model =
             """
             namespace test
@@ -350,7 +278,7 @@ class ServerHttpSensitivityGeneratorTest {
             }
             """.asSmithyModel()
         val operation = model.operationShapes.toList()[0]
-        val generator = ServerHttpSensitivityGenerator(model, operation, smithyHttpServerType, httpType)
+        val generator = ServerHttpSensitivityGenerator(model, operation, ServerTestRuntimeConfig)
 
         val inputShape = operation.inputShape(model)
         val headerData = generator.findHeaderSensitivity(inputShape)
@@ -376,19 +304,8 @@ class ServerHttpSensitivityGeneratorTest {
         testProject.compileAndTest()
     }
 
-    @ParameterizedTest(name = "{1}")
-    @MethodSource("httpVersions")
-    fun `prefix header closure`(
-        http1x: Boolean,
-        @Suppress("UNUSED_PARAMETER") displayName: String,
-    ) {
-        val (smithyHttpServerType, httpType) = getDependencies(http1x)
-        val codegenScope =
-            arrayOf(
-                "SmithyHttpServer" to smithyHttpServerType,
-                "Http" to httpType,
-            )
-
+    @Test
+    fun `prefix header closure`() {
         val model =
             """
             namespace test
@@ -411,7 +328,7 @@ class ServerHttpSensitivityGeneratorTest {
 
             """.asSmithyModel()
         val operation = model.operationShapes.toList()[0]
-        val generator = ServerHttpSensitivityGenerator(model, operation, smithyHttpServerType, httpType)
+        val generator = ServerHttpSensitivityGenerator(model, operation, ServerTestRuntimeConfig)
 
         val inputShape = operation.inputShape(model)
         val headerData = generator.findHeaderSensitivity(inputShape)
@@ -438,14 +355,8 @@ class ServerHttpSensitivityGeneratorTest {
         testProject.compileAndTest()
     }
 
-    @ParameterizedTest(name = "{1}")
-    @MethodSource("httpVersions")
-    fun `prefix header none`(
-        http1x: Boolean,
-        @Suppress("UNUSED_PARAMETER") displayName: String,
-    ) {
-        val (smithyHttpServerType, httpType) = getDependencies(http1x)
-
+    @Test
+    fun `prefix header none`() {
         val model =
             """
             namespace test
@@ -467,7 +378,7 @@ class ServerHttpSensitivityGeneratorTest {
 
             """.asSmithyModel()
         val operation = model.operationShapes.toList()[0]
-        val generator = ServerHttpSensitivityGenerator(model, operation, smithyHttpServerType, httpType)
+        val generator = ServerHttpSensitivityGenerator(model, operation, ServerTestRuntimeConfig)
 
         val inputShape = operation.inputShape(model)
         val headerData = generator.findHeaderSensitivity(inputShape)
@@ -475,19 +386,8 @@ class ServerHttpSensitivityGeneratorTest {
         assert(!headerData.hasRedactions())
     }
 
-    @ParameterizedTest(name = "{1}")
-    @MethodSource("httpVersions")
-    fun `prefix headers key closure`(
-        http1x: Boolean,
-        @Suppress("UNUSED_PARAMETER") displayName: String,
-    ) {
-        val (smithyHttpServerType, httpType) = getDependencies(http1x)
-        val codegenScope =
-            arrayOf(
-                "SmithyHttpServer" to smithyHttpServerType,
-                "Http" to httpType,
-            )
-
+    @Test
+    fun `prefix headers key closure`() {
         val model =
             """
             namespace test
@@ -511,7 +411,7 @@ class ServerHttpSensitivityGeneratorTest {
 
             """.asSmithyModel()
         val operation = model.operationShapes.toList()[0]
-        val generator = ServerHttpSensitivityGenerator(model, operation, smithyHttpServerType, httpType)
+        val generator = ServerHttpSensitivityGenerator(model, operation, ServerTestRuntimeConfig)
 
         val inputShape = operation.inputShape(model)
         val headerData = generator.findHeaderSensitivity(inputShape)
@@ -540,19 +440,8 @@ class ServerHttpSensitivityGeneratorTest {
         testProject.compileAndTest()
     }
 
-    @ParameterizedTest(name = "{1}")
-    @MethodSource("httpVersions")
-    fun `prefix headers value closure`(
-        http1x: Boolean,
-        @Suppress("UNUSED_PARAMETER") displayName: String,
-    ) {
-        val (smithyHttpServerType, httpType) = getDependencies(http1x)
-        val codegenScope =
-            arrayOf(
-                "SmithyHttpServer" to smithyHttpServerType,
-                "Http" to httpType,
-            )
-
+    @Test
+    fun `prefix headers value closure`() {
         val model =
             """
             namespace test
@@ -576,7 +465,7 @@ class ServerHttpSensitivityGeneratorTest {
             }
             """.asSmithyModel()
         val operation = model.operationShapes.toList()[0]
-        val generator = ServerHttpSensitivityGenerator(model, operation, smithyHttpServerType, httpType)
+        val generator = ServerHttpSensitivityGenerator(model, operation, ServerTestRuntimeConfig)
 
         val inputShape = operation.inputShape(model)
         val headerData = generator.findHeaderSensitivity(inputShape)
@@ -606,19 +495,8 @@ class ServerHttpSensitivityGeneratorTest {
         testProject.compileAndTest()
     }
 
-    @ParameterizedTest(name = "{1}")
-    @MethodSource("httpVersions")
-    fun `uri closure`(
-        http1x: Boolean,
-        @Suppress("UNUSED_PARAMETER") displayName: String,
-    ) {
-        val (smithyHttpServerType, httpType) = getDependencies(http1x)
-        val codegenScope =
-            arrayOf(
-                "SmithyHttpServer" to smithyHttpServerType,
-                "Http" to httpType,
-            )
-
+    @Test
+    fun `uri closure`() {
         val model =
             """
             namespace test
@@ -641,7 +519,7 @@ class ServerHttpSensitivityGeneratorTest {
             }
             """.asSmithyModel()
         val operation = model.operationShapes.toList()[0]
-        val generator = ServerHttpSensitivityGenerator(model, operation, smithyHttpServerType, httpType)
+        val generator = ServerHttpSensitivityGenerator(model, operation, ServerTestRuntimeConfig)
 
         val input = generator.input()!!
         val uri = operation.getTrait<HttpTrait>()!!.uri
@@ -667,14 +545,8 @@ class ServerHttpSensitivityGeneratorTest {
         testProject.compileAndTest()
     }
 
-    @ParameterizedTest(name = "{1}")
-    @MethodSource("httpVersions")
-    fun `uri greedy`(
-        http1x: Boolean,
-        @Suppress("UNUSED_PARAMETER") displayName: String,
-    ) {
-        val (smithyHttpServerType, httpType) = getDependencies(http1x)
-
+    @Test
+    fun `uri greedy`() {
         val model =
             """
             namespace test
@@ -697,7 +569,7 @@ class ServerHttpSensitivityGeneratorTest {
             }
             """.asSmithyModel()
         val operation = model.operationShapes.toList()[0]
-        val generator = ServerHttpSensitivityGenerator(model, operation, smithyHttpServerType, httpType)
+        val generator = ServerHttpSensitivityGenerator(model, operation, ServerTestRuntimeConfig)
 
         val input = generator.input()!!
         val uri = operation.getTrait<HttpTrait>()!!.uri

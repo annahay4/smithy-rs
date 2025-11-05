@@ -11,6 +11,7 @@ import software.amazon.smithy.model.shapes.ShapeId
 import software.amazon.smithy.rust.codegen.core.smithy.CODEGEN_SETTINGS
 import software.amazon.smithy.rust.codegen.core.smithy.CoreCodegenConfig
 import software.amazon.smithy.rust.codegen.core.smithy.CoreRustSettings
+import software.amazon.smithy.rust.codegen.core.smithy.HttpVersion
 import software.amazon.smithy.rust.codegen.core.smithy.RuntimeConfig
 import java.util.Optional
 
@@ -62,6 +63,16 @@ data class ServerRustSettings(
             val coreRustSettings = CoreRustSettings.from(model, config)
             val codegenSettingsNode = config.getObjectMember(CODEGEN_SETTINGS)
             val coreCodegenConfig = CoreCodegenConfig.fromNode(codegenSettingsNode)
+
+            // Create ServerCodegenConfig first to read the http-1x flag
+            val serverCodegenConfig = ServerCodegenConfig.fromCodegenConfigAndNode(coreCodegenConfig, codegenSettingsNode)
+
+            // Use the http1x field from ServerCodegenConfig to set RuntimeConfig httpVersion
+            // This must be done because RuntimeConfig is created in CoreRustSettings.from()
+            // before we have access to the http-1x flag
+            val httpVersion = if (serverCodegenConfig.http1x) HttpVersion.Http1x else HttpVersion.Http0x
+            val runtimeConfig = coreRustSettings.runtimeConfig.copy(httpVersion = httpVersion)
+
             return ServerRustSettings(
                 service = coreRustSettings.service,
                 moduleName = coreRustSettings.moduleName,
@@ -69,8 +80,8 @@ data class ServerRustSettings(
                 moduleAuthors = coreRustSettings.moduleAuthors,
                 moduleDescription = coreRustSettings.moduleDescription,
                 moduleRepository = coreRustSettings.moduleRepository,
-                runtimeConfig = coreRustSettings.runtimeConfig,
-                codegenConfig = ServerCodegenConfig.fromCodegenConfigAndNode(coreCodegenConfig, codegenSettingsNode),
+                runtimeConfig = runtimeConfig,
+                codegenConfig = serverCodegenConfig,
                 license = coreRustSettings.license,
                 examplesUri = coreRustSettings.examplesUri,
                 minimumSupportedRustVersion = coreRustSettings.minimumSupportedRustVersion,
@@ -109,7 +120,7 @@ data class ServerCodegenConfig(
         private val defaultExperimentalCustomValidationExceptionWithReasonPleaseDoNotUse = null
         private const val DEFAULT_ADD_VALIDATION_EXCEPTION_TO_CONSTRAINED_OPERATIONS = false
         private const val DEFAULT_SEND_EVENT_STREAM_INITIAL_RESPONSE = false
-        private const val DEFAULT_HTTP_1X = false
+        const val DEFAULT_HTTP_1X = false
 
         /**
          * Configuration key for the HTTP 1.x flag.

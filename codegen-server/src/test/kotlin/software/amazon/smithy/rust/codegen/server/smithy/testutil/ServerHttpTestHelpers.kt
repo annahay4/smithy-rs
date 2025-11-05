@@ -5,11 +5,15 @@
 
 package software.amazon.smithy.rust.codegen.server.smithy.testutil
 
+import software.amazon.smithy.rust.codegen.core.rustlang.CargoDependency
 import software.amazon.smithy.rust.codegen.core.rustlang.Writable
 import software.amazon.smithy.rust.codegen.core.rustlang.rust
 import software.amazon.smithy.rust.codegen.core.rustlang.rustTemplate
 import software.amazon.smithy.rust.codegen.core.rustlang.writable
+import software.amazon.smithy.rust.codegen.core.smithy.HttpVersion
+import software.amazon.smithy.rust.codegen.core.smithy.RuntimeConfig
 import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
+import software.amazon.smithy.rust.codegen.server.smithy.ServerCargoDependency
 import software.amazon.smithy.rust.codegen.server.smithy.ServerCodegenContext
 
 /**
@@ -22,10 +26,15 @@ object ServerHttpTestHelpers {
      * This should be used instead of hardcoding RuntimeType.Http, RuntimeType.Hyper, etc.
      */
     fun getHttpRuntimeTypeScope(codegenContext: ServerCodegenContext): Array<Pair<String, RuntimeType>> {
-        val httpDeps = codegenContext.httpDependencies()
+        val httpModule =
+            if (codegenContext.runtimeConfig.httpVersion == HttpVersion.Http0x) {
+                CargoDependency.Http
+            } else {
+                CargoDependency.Http1x
+            }
         return arrayOf(
-            "Http" to httpDeps.httpModule(),
-            "Hyper" to RuntimeType.Hyper,
+            "Http" to httpModule.toType(),
+            "Hyper" to RuntimeType.hyperForConfig(codegenContext.runtimeConfig),
             "Tower" to RuntimeType.Tower,
             *RuntimeType.preludeScope,
         )
@@ -44,46 +53,52 @@ object ServerHttpTestHelpers {
         bytesVariable: String,
     ): Writable =
         writable {
-            if (codegenContext.isHttp1()) {
+            if (codegenContext.runtimeConfig.httpVersion == HttpVersion.Http1x) {
                 rustTemplate(
                     """#{HttpBodyUtilFull}::new(#{Bytes}::from($bytesVariable))""",
-                    "HttpBodyUtilFull" to codegenContext.httpDependencies().httpBodyUtil!!.toType().resolve("Full"),
+                    "HttpBodyUtilFull" to CargoDependency.HttpBodyUtil01x.toType().resolve("Full"),
                     "Bytes" to RuntimeType.Bytes,
                 )
             } else {
                 rustTemplate(
                     """#{SmithyHttpServerBody}::from($bytesVariable)""",
-                    "SmithyHttpServerBody" to codegenContext.httpDependencies().smithyHttpServer.toType().resolve("body").resolve("Body"),
+                    "SmithyHttpServerBody" to
+                        ServerCargoDependency.smithyHttpServer(codegenContext.runtimeConfig)
+                            .toType().resolve("body").resolve("Body"),
                 )
             }
         }
 
     /**
-     * Creates a writable that generates code to read all bytes from an HTTP response body.
+     * Returns a Writable that generates version-appropriate code for reading HTTP response body to bytes.
+     * For HTTP 1.x: Uses http_body_util::BodyExt::collect()
+     * For HTTP 0.x: Uses hyper::body::to_bytes()
      *
-     * For HTTP 0.x: `hyper::body::to_bytes(body).await`
-     * For HTTP 1.x: `http_body_util::BodyExt::collect(body).await?.to_bytes()`
+     * @param responseVarName The name of the HTTP response variable (e.g., "http_response")
      */
-    fun readBodyBytes(
-        codegenContext: ServerCodegenContext,
-        bodyExpr: String,
+    fun httpBodyToBytes(
+        runtimeConfig: RuntimeConfig,
+        bodyVarName: String,
+        responseVarName: String,
     ): Writable =
         writable {
-            if (codegenContext.isHttp1()) {
-                rustTemplate(
-                    """
-                {
-                    use #{BodyExt};
-                    $bodyExpr.collect().await.expect("failed to read body").to_bytes()
-                }
-                """,
-                    "BodyExt" to codegenContext.httpDependencies().httpBodyUtil!!.toType().resolve("BodyExt"),
-                )
-            } else {
-                rustTemplate(
-                    """#{Hyper}::body::to_bytes($bodyExpr).await.expect("failed to read body")""",
-                    "Hyper" to RuntimeType.Hyper,
-                )
+            when (runtimeConfig.httpVersion) {
+                HttpVersion.Http1x ->
+                    rustTemplate(
+                        """
+                        use #{HttpBodyUtil}::BodyExt;
+                        let $bodyVarName = $responseVarName.into_body().collect().await.expect("unable to collect body").to_bytes();
+                        """,
+                        "HttpBodyUtil" to CargoDependency.HttpBodyUtil01x.toType(),
+                    )
+
+                HttpVersion.Http0x ->
+                    rustTemplate(
+                        """
+                        let $bodyVarName = #{Hyper}::body::to_bytes($responseVarName.into_body()).await.expect("unable to extract body to bytes");
+                        """,
+                        "Hyper" to RuntimeType.Hyper,
+                    )
             }
         }
 
@@ -99,7 +114,12 @@ object ServerHttpTestHelpers {
         bodyVariable: String,
     ): Writable =
         writable {
-            val httpDeps = codegenContext.httpDependencies()
+            val httpModule =
+                if (codegenContext.runtimeConfig.httpVersion == HttpVersion.Http1x) {
+                    CargoDependency.Http1x.toType()
+                } else {
+                    CargoDependency.Http.toType()
+                }
             rustTemplate(
                 """
             #{Http}::Request::builder()
@@ -109,7 +129,7 @@ object ServerHttpTestHelpers {
                 .body(#{Body:W})
                 .expect("failed to build request")
             """,
-                "Http" to httpDeps.httpModule(),
+                "Http" to httpModule,
                 "Headers" to
                     writable {
                         headers.forEach { (name, value) ->

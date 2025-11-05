@@ -13,6 +13,7 @@ import software.amazon.smithy.protocol.traits.Rpcv2CborTrait
 import software.amazon.smithy.rust.codegen.core.rustlang.Writable
 import software.amazon.smithy.rust.codegen.core.rustlang.withBlockTemplate
 import software.amazon.smithy.rust.codegen.core.rustlang.writable
+import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
 import software.amazon.smithy.rust.codegen.core.smithy.protocols.AwsJsonVersion
 import software.amazon.smithy.rust.codegen.core.smithy.protocols.ProtocolLoader
 import software.amazon.smithy.rust.codegen.core.smithy.protocols.ProtocolMap
@@ -35,7 +36,7 @@ class StreamPayloadSerializerCustomization : ServerHttpBoundProtocolCustomizatio
                         withBlockTemplate(
                             "#{FuturesStreamCompatByteStream}::new(",
                             ")",
-                            "FuturesStreamCompatByteStream" to section.params.codegenContext.httpDependencies().smithyHttp.toType().resolve("futures_stream_adapter::FuturesStreamCompatByteStream"),
+                            "FuturesStreamCompatByteStream" to RuntimeType.futuresStreamCompatByteStream(section.params.codegenContext.runtimeConfig),
                         ) {
                             section.params.payloadGenerator.generatePayload(
                                 this,

@@ -17,6 +17,7 @@ import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
 import software.amazon.smithy.rust.codegen.core.testutil.asSmithyModel
 import software.amazon.smithy.rust.codegen.core.testutil.testModule
 import software.amazon.smithy.rust.codegen.core.testutil.unitTest
+import software.amazon.smithy.rust.codegen.server.smithy.ServerCargoDependency
 import software.amazon.smithy.rust.codegen.server.smithy.ServerCodegenContext
 import software.amazon.smithy.rust.codegen.server.smithy.customize.ServerCodegenDecorator
 import software.amazon.smithy.rust.codegen.server.smithy.testutil.HttpTestType
@@ -37,7 +38,7 @@ internal class ServiceConfigGeneratorTest {
                     get() = -69
 
                 override fun configMethods(codegenContext: ServerCodegenContext): List<ConfigMethod> {
-                    val smithyHttpServer = codegenContext.httpDependencies().smithyHttpServer.toType()
+                    val smithyHttpServer = ServerCargoDependency.smithyHttpServer(codegenContext.runtimeConfig).toType()
                     val codegenScope =
                         arrayOf(
                             "SmithyHttpServer" to smithyHttpServer,
@@ -99,7 +100,7 @@ internal class ServiceConfigGeneratorTest {
             additionalDecorators = listOf(decorator),
             testCoverage = HttpTestType.BOTH,
         ) { context, rustCrate ->
-            val smithyHttpServer = context.httpDependencies().smithyHttpServer.toType()
+            val smithyServer = ServerCargoDependency.smithyHttpServer(context.runtimeConfig).toType()
             rustCrate.testModule {
                 rustTemplate(
                     """
@@ -107,7 +108,7 @@ internal class ServiceConfigGeneratorTest {
                     use #{SmithyHttpServer}::plugin::IdentityPlugin;
                     use crate::server::plugin::PluginStack;
                     """,
-                    "SmithyHttpServer" to smithyHttpServer,
+                    "SmithyHttpServer" to smithyServer,
                 )
 
                 unitTest("successful_config_initialization") {
@@ -221,7 +222,7 @@ internal class ServiceConfigGeneratorTest {
             additionalDecorators = listOf(decorator),
             testCoverage = HttpTestType.BOTH,
         ) { context, rustCrate ->
-            val smithyHttpServer = context.httpDependencies().smithyHttpServer.toType()
+            val smithyServer = ServerCargoDependency.smithyHttpServer(context.runtimeConfig).toType()
             rustCrate.testModule {
                 unitTest("successful_config_initialization_applying_the_three_layers") {
                     rustTemplate(
@@ -244,7 +245,7 @@ internal class ServiceConfigGeneratorTest {
                             .three_non_required_layers()
                             .build();
                         """,
-                        "SmithyHttpServer" to smithyHttpServer,
+                        "SmithyHttpServer" to smithyServer,
                     )
                 }
 

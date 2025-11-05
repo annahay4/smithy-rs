@@ -22,7 +22,6 @@ import software.amazon.smithy.model.shapes.TimestampShape
 import software.amazon.smithy.model.shapes.UnionShape
 import software.amazon.smithy.model.traits.EventHeaderTrait
 import software.amazon.smithy.model.traits.EventPayloadTrait
-import software.amazon.smithy.rust.codegen.core.rustlang.CargoDependency
 import software.amazon.smithy.rust.codegen.core.rustlang.RustModule
 import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
 import software.amazon.smithy.rust.codegen.core.rustlang.conditionalBlock
@@ -53,7 +52,6 @@ class EventStreamUnmarshallerGenerator(
     codegenContext: CodegenContext,
     private val operationShape: OperationShape,
     private val unionShape: UnionShape,
-    private val smithyHttpDependency: CargoDependency = CargoDependency.smithyHttp(codegenContext.runtimeConfig),
 ) {
     private val model = codegenContext.model
     private val builderInstantiator = codegenContext.builderInstantiator()
@@ -63,7 +61,7 @@ class EventStreamUnmarshallerGenerator(
     private val unionSymbol = symbolProvider.toSymbol(unionShape)
     private val errorSymbol =
         if (codegenTarget == CodegenTarget.SERVER && unionShape.eventStreamErrors().isEmpty()) {
-            smithyHttpDependency.toType().resolve("event_stream::MessageStreamError").toSymbol()
+            RuntimeType.smithyHttp(runtimeConfig).resolve("event_stream::MessageStreamError").toSymbol()
         } else {
             symbolProvider.symbolForEventStreamError(unionShape)
         }

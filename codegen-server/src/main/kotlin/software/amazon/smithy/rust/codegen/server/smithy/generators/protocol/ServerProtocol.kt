@@ -16,6 +16,7 @@ import software.amazon.smithy.rust.codegen.core.rustlang.rust
 import software.amazon.smithy.rust.codegen.core.rustlang.rustTemplate
 import software.amazon.smithy.rust.codegen.core.rustlang.writable
 import software.amazon.smithy.rust.codegen.core.smithy.CodegenContext
+import software.amazon.smithy.rust.codegen.core.smithy.RuntimeConfig
 import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
 import software.amazon.smithy.rust.codegen.core.smithy.isOptional
 import software.amazon.smithy.rust.codegen.core.smithy.protocols.AwsJson
@@ -40,7 +41,9 @@ import software.amazon.smithy.rust.codegen.core.smithy.protocols.restJsonFieldNa
 import software.amazon.smithy.rust.codegen.core.smithy.protocols.serialize.CborSerializerGenerator
 import software.amazon.smithy.rust.codegen.core.smithy.protocols.serialize.StructuredDataSerializerGenerator
 import software.amazon.smithy.rust.codegen.core.util.dq
+import software.amazon.smithy.rust.codegen.server.smithy.ServerCargoDependency
 import software.amazon.smithy.rust.codegen.server.smithy.ServerCodegenContext
+import software.amazon.smithy.rust.codegen.server.smithy.ServerRuntimeType
 import software.amazon.smithy.rust.codegen.server.smithy.canReachConstrainedShape
 import software.amazon.smithy.rust.codegen.server.smithy.customizations.AddTypeFieldToServerErrorsCborCustomization
 import software.amazon.smithy.rust.codegen.server.smithy.customizations.BeforeEncodingMapOrCollectionCborCustomization
@@ -89,18 +92,18 @@ interface ServerProtocol : Protocol {
     fun serverContentTypeCheckNoModeledInput(): Boolean = false
 
     /** The protocol-specific `RequestRejection` type. **/
-    fun requestRejection(smithyHttpServer: CargoDependency): RuntimeType =
-        smithyHttpServer
+    fun requestRejection(runtimeConfig: RuntimeConfig): RuntimeType =
+        ServerCargoDependency.smithyHttpServer(runtimeConfig)
             .toType().resolve("protocol::$protocolModulePath::rejection::RequestRejection")
 
     /** The protocol-specific `ResponseRejection` type. **/
-    fun responseRejection(smithyHttpServer: CargoDependency): RuntimeType =
-        smithyHttpServer
+    fun responseRejection(runtimeConfig: RuntimeConfig): RuntimeType =
+        ServerCargoDependency.smithyHttpServer(runtimeConfig)
             .toType().resolve("protocol::$protocolModulePath::rejection::ResponseRejection")
 
     /** The protocol-specific `RuntimeError` type. **/
-    fun runtimeError(smithyHttpServer: CargoDependency): RuntimeType =
-        smithyHttpServer
+    fun runtimeError(runtimeConfig: RuntimeConfig): RuntimeType =
+        ServerCargoDependency.smithyHttpServer(runtimeConfig)
             .toType().resolve("protocol::$protocolModulePath::runtime_error::RuntimeError")
 
     /**
@@ -149,7 +152,6 @@ class ServerAwsJsonProtocol(
     private val additionalParserCustomizations: List<JsonParserCustomization> = listOf(),
 ) : AwsJson(serverCodegenContext, awsJsonVersion), ServerProtocol {
     private val runtimeConfig = codegenContext.runtimeConfig
-    private val httpDeps = serverCodegenContext.httpDependencies()
 
     override val protocolModulePath: String
         get() =
@@ -171,13 +173,13 @@ class ServerAwsJsonProtocol(
 
     override fun markerStruct(): RuntimeType {
         return when (version) {
-            is AwsJsonVersion.Json10 -> httpDeps.smithyHttpServer.toType().resolve("protocol::$protocolModulePath::AwsJson1_0")
-            is AwsJsonVersion.Json11 -> httpDeps.smithyHttpServer.toType().resolve("protocol::$protocolModulePath::AwsJson1_1")
+            is AwsJsonVersion.Json10 -> ServerRuntimeType.protocol("AwsJson1_0", protocolModulePath, runtimeConfig)
+            is AwsJsonVersion.Json11 -> ServerRuntimeType.protocol("AwsJson1_1", protocolModulePath, runtimeConfig)
         }
     }
 
     override fun routerType() =
-        httpDeps.smithyHttpServer.toType()
+        ServerCargoDependency.smithyHttpServer(runtimeConfig).toType()
             .resolve("protocol::aws_json::router::AwsJsonRouter")
 
     /**
@@ -200,16 +202,16 @@ class ServerAwsJsonProtocol(
             AwsJsonVersion.Json11 -> "new_aws_json_11_router"
         }
 
-    override fun requestRejection(smithyHttpServer: CargoDependency): RuntimeType =
-        smithyHttpServer
+    override fun requestRejection(runtimeConfig: RuntimeConfig): RuntimeType =
+        ServerCargoDependency.smithyHttpServer(runtimeConfig)
             .toType().resolve("protocol::aws_json::rejection::RequestRejection")
 
-    override fun responseRejection(smithyHttpServer: CargoDependency): RuntimeType =
-        smithyHttpServer
+    override fun responseRejection(runtimeConfig: RuntimeConfig): RuntimeType =
+        ServerCargoDependency.smithyHttpServer(runtimeConfig)
             .toType().resolve("protocol::aws_json::rejection::ResponseRejection")
 
-    override fun runtimeError(smithyHttpServer: CargoDependency): RuntimeType =
-        smithyHttpServer
+    override fun runtimeError(runtimeConfig: RuntimeConfig): RuntimeType =
+        ServerCargoDependency.smithyHttpServer(runtimeConfig)
             .toType().resolve("protocol::aws_json::runtime_error::RuntimeError")
 
     /*
@@ -220,19 +222,20 @@ class ServerAwsJsonProtocol(
         deserializePayloadErrorType(
             codegenContext,
             binding,
-            requestRejection(httpDeps.smithyHttpServer),
-            (codegenContext as ServerCodegenContext).httpDependencies().smithyJsonModule().resolve("deserialize::error::DeserializeError"),
+            requestRejection(runtimeConfig),
+            RuntimeType.smithyJson(codegenContext.runtimeConfig).resolve("deserialize::error::DeserializeError"),
         )
 }
+
+private fun restRouterType(runtimeConfig: RuntimeConfig) =
+    ServerCargoDependency.smithyHttpServer(runtimeConfig).toType()
+        .resolve("protocol::rest::router::RestRouter")
 
 class ServerRestJsonProtocol(
     private val serverCodegenContext: ServerCodegenContext,
     private val additionalParserCustomizations: List<JsonParserCustomization> = listOf(),
 ) : RestJson(serverCodegenContext), ServerProtocol {
     val runtimeConfig = codegenContext.runtimeConfig
-
-    // Get HTTP dependencies once based on http-1x configuration
-    private val httpDeps = serverCodegenContext.httpDependencies()
 
     override val protocolModulePath: String = "rest_json_1"
 
@@ -247,9 +250,9 @@ class ServerRestJsonProtocol(
     override fun structuredDataSerializer(): StructuredDataSerializerGenerator =
         ServerRestJsonSerializerGenerator(serverCodegenContext, httpBindingResolver)
 
-    override fun markerStruct() = httpDeps.smithyHttpServer.toType().resolve("protocol::$protocolModulePath::RestJson1")
+    override fun markerStruct() = ServerRuntimeType.protocol("RestJson1", protocolModulePath, runtimeConfig)
 
-    override fun routerType() = httpDeps.smithyHttpServer.toType().resolve("protocol::rest::router::RestRouter")
+    override fun routerType() = restRouterType(runtimeConfig)
 
     override fun serverRouterRequestSpec(
         operationShape: OperationShape,
@@ -257,7 +260,7 @@ class ServerRestJsonProtocol(
         serviceName: String,
         requestSpecModule: RuntimeType,
     ): Writable =
-        RestRequestSpecGenerator(httpBindingResolver, requestSpecModule, httpDeps.httpModule()).generate(operationShape)
+        RestRequestSpecGenerator(httpBindingResolver, requestSpecModule, runtimeConfig).generate(operationShape)
 
     override fun serverRouterRequestSpecType(requestSpecModule: RuntimeType): RuntimeType =
         requestSpecModule.resolve("RequestSpec")
@@ -270,24 +273,20 @@ class ServerRestJsonProtocol(
         deserializePayloadErrorType(
             codegenContext,
             binding,
-            requestRejection(httpDeps.smithyHttpServer),
-            (codegenContext as ServerCodegenContext).httpDependencies().smithyJsonModule().resolve("deserialize::error::DeserializeError"),
+            requestRejection(runtimeConfig),
+            RuntimeType.smithyJson(codegenContext.runtimeConfig).resolve("deserialize::error::DeserializeError"),
         )
 }
 
 class ServerRestXmlProtocol(
-    serverCodegenContext: ServerCodegenContext,
-) : RestXml(serverCodegenContext), ServerProtocol {
+    codegenContext: CodegenContext,
+) : RestXml(codegenContext), ServerProtocol {
     val runtimeConfig = codegenContext.runtimeConfig
-
-    // Get HTTP dependencies once based on http-1x configuration
-    private val httpDeps = serverCodegenContext.httpDependencies()
-
     override val protocolModulePath = "rest_xml"
 
-    override fun markerStruct() = httpDeps.smithyHttpServer.toType().resolve("protocol::$protocolModulePath::RestXml")
+    override fun markerStruct() = ServerRuntimeType.protocol("RestXml", protocolModulePath, runtimeConfig)
 
-    override fun routerType() = httpDeps.smithyHttpServer.toType().resolve("protocol::rest::router::RestRouter")
+    override fun routerType() = restRouterType(runtimeConfig)
 
     override fun serverRouterRequestSpec(
         operationShape: OperationShape,
@@ -295,7 +294,7 @@ class ServerRestXmlProtocol(
         serviceName: String,
         requestSpecModule: RuntimeType,
     ): Writable =
-        RestRequestSpecGenerator(httpBindingResolver, requestSpecModule, httpDeps.httpModule()).generate(operationShape)
+        RestRequestSpecGenerator(httpBindingResolver, requestSpecModule, runtimeConfig).generate(operationShape)
 
     override fun serverRouterRequestSpecType(requestSpecModule: RuntimeType): RuntimeType =
         requestSpecModule.resolve("RequestSpec")
@@ -308,8 +307,8 @@ class ServerRestXmlProtocol(
         deserializePayloadErrorType(
             codegenContext,
             binding,
-            requestRejection(httpDeps.smithyHttpServer),
-            httpDeps.smithyXmlModule().resolve("decode::XmlDecodeError"),
+            requestRejection(runtimeConfig),
+            RuntimeType.smithyXml(runtimeConfig).resolve("decode::XmlDecodeError"),
         )
 }
 
@@ -317,7 +316,6 @@ class ServerRpcV2CborProtocol(
     private val serverCodegenContext: ServerCodegenContext,
 ) : RpcV2Cbor(serverCodegenContext), ServerProtocol {
     val runtimeConfig = codegenContext.runtimeConfig
-    private val httpDeps = serverCodegenContext.httpDependencies()
 
     override val protocolModulePath = "rpc_v2_cbor"
 
@@ -332,7 +330,7 @@ class ServerRpcV2CborProtocol(
                         """,
                         *RuntimeType.preludeScope,
                         "Error" to
-                            httpDeps.smithyCborModule()
+                            CargoDependency.smithyCbor(runtimeConfig).toType()
                                 .resolve("decode::DeserializeError"),
                     )
                 }
@@ -359,10 +357,10 @@ class ServerRpcV2CborProtocol(
         )
     }
 
-    override fun markerStruct() = httpDeps.smithyHttpServer.toType().resolve("protocol::rpc_v2_cbor::RpcV2Cbor")
+    override fun markerStruct() = ServerRuntimeType.protocol("RpcV2Cbor", "rpc_v2_cbor", runtimeConfig)
 
     override fun routerType() =
-        httpDeps.smithyHttpServer.toType()
+        ServerCargoDependency.smithyHttpServer(runtimeConfig).toType()
             .resolve("protocol::rpc_v2_cbor::router::RpcV2CborRouter")
 
     override fun serverRouterRequestSpec(
@@ -388,8 +386,8 @@ class ServerRpcV2CborProtocol(
         deserializePayloadErrorType(
             codegenContext,
             binding,
-            requestRejection(httpDeps.smithyHttpServer),
-            httpDeps.smithyCborModule().resolve("decode::DeserializeError"),
+            requestRejection(runtimeConfig),
+            RuntimeType.smithyCbor(codegenContext.runtimeConfig).resolve("decode::DeserializeError"),
         )
 }
 

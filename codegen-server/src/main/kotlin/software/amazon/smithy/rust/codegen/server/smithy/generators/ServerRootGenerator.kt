@@ -6,16 +6,15 @@
 package software.amazon.smithy.rust.codegen.server.smithy.generators
 
 import software.amazon.smithy.model.knowledge.TopDownIndex
-import software.amazon.smithy.rust.codegen.core.rustlang.CargoDependency
-import software.amazon.smithy.rust.codegen.core.rustlang.CratesIo
-import software.amazon.smithy.rust.codegen.core.rustlang.DependencyScope
 import software.amazon.smithy.rust.codegen.core.rustlang.RustReservedWords
 import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
 import software.amazon.smithy.rust.codegen.core.rustlang.Writable
 import software.amazon.smithy.rust.codegen.core.rustlang.join
 import software.amazon.smithy.rust.codegen.core.rustlang.rust
 import software.amazon.smithy.rust.codegen.core.rustlang.rustTemplate
-import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
+import software.amazon.smithy.rust.codegen.core.rustlang.writable
+import software.amazon.smithy.rust.codegen.core.smithy.HttpVersion
+import software.amazon.smithy.rust.codegen.core.smithy.RuntimeConfig
 import software.amazon.smithy.rust.codegen.core.util.toPascalCase
 import software.amazon.smithy.rust.codegen.core.util.toSnakeCase
 import software.amazon.smithy.rust.codegen.server.smithy.ServerCargoDependency
@@ -45,6 +44,145 @@ open class ServerRootGenerator(
             },
         ).toList()
     private val serviceName = codegenContext.serviceShape.id.name.toPascalCase()
+
+    /**
+     * Returns a Writable containing the appropriate Hyper usage example based on HTTP version.
+     * For HTTP 1.x: Uses tokio::net::TcpListener and serve() function
+     * For HTTP 0.x: Uses hyper::Server::bind() API
+     */
+    private fun hyperServeExample(
+        crateName: String,
+        serviceName: String,
+        unwrapConfigBuilder: String,
+    ): Writable =
+        writable {
+            when (codegenContext.settings.runtimeConfig.httpVersion) {
+                HttpVersion.Http1x ->
+                    rustTemplate(
+                        """
+                        //! ```rust,no_run
+                        //! ## use std::net::SocketAddr;
+                        //! ## async fn dummy() {
+                        //! use $crateName::{$serviceName, ${serviceName}Config};
+                        //! use $crateName::server::serve;
+                        //! use #{Tokio}::net::TcpListener;
+                        //!
+                        //! ## let app = $serviceName::builder(
+                        //! ##     ${serviceName}Config::builder()
+                        //! ##         .build()$unwrapConfigBuilder
+                        //! ## ).build_unchecked();
+                        //! let bind: SocketAddr = "127.0.0.1:6969".parse()
+                        //!     .expect("unable to parse the server bind address and port");
+                        //! let listener = TcpListener::bind(bind).await
+                        //!     .expect("failed to bind TCP listener");
+                        //! serve(listener, app.into_make_service()).await.unwrap();
+                        //! ## }
+                        //! ```
+                        """,
+                        "Tokio" to ServerCargoDependency.TokioDev.toType(),
+                    )
+
+                HttpVersion.Http0x ->
+                    rustTemplate(
+                        """
+                        //! ```rust,no_run
+                        //! ## use std::net::SocketAddr;
+                        //! ## async fn dummy() {
+                        //! use $crateName::{$serviceName, ${serviceName}Config};
+                        //!
+                        //! ## let app = $serviceName::builder(
+                        //! ##     ${serviceName}Config::builder()
+                        //! ##         .build()$unwrapConfigBuilder
+                        //! ## ).build_unchecked();
+                        //! let server = app.into_make_service();
+                        //! let bind: SocketAddr = "127.0.0.1:6969".parse()
+                        //!     .expect("unable to parse the server bind address and port");
+                        //! #{Hyper0}::Server::bind(&bind).serve(server).await.unwrap();
+                        //! ## }
+                        //! 
+                        //! ```
+                        """,
+                        "Hyper0" to ServerCargoDependency.hyperDev(codegenContext.runtimeConfig).toType(),
+                    )
+            }
+        }
+
+    /**
+     * Returns a Writable containing the appropriate full example code based on HTTP version.
+     * For HTTP 1.x: Uses tokio::net::TcpListener and serve() function
+     * For HTTP 0.x: Uses hyper::Server::bind() API
+     */
+    private fun fullExample(
+        crateName: String,
+        serviceName: String,
+        unwrapConfigBuilder: String,
+        builderFieldNames: Map<*, String>,
+    ): Writable =
+        writable {
+            when (codegenContext.settings.runtimeConfig.httpVersion) {
+                HttpVersion.Http1x ->
+                    rustTemplate(
+                        """
+                        //! ```rust,no_run
+                        //! ## use std::net::SocketAddr;
+                        //! use $crateName::{$serviceName, ${serviceName}Config};
+                        //! use $crateName::server::serve;
+                        //! use #{Tokio}::net::TcpListener;
+                        //!
+                        //! ##[#{Tokio}::main]
+                        //! pub async fn main() {
+                        //!    let config = ${serviceName}Config::builder().build()$unwrapConfigBuilder;
+                        //!    let app = $serviceName::builder(config)
+                        ${builderFieldNames.values.joinToString("\n") { "//!        .$it($it)" }}
+                        //!        .build()
+                        //!        .expect("failed to build an instance of $serviceName");
+                        //!
+                        //!    let bind: SocketAddr = "127.0.0.1:6969".parse()
+                        //!        .expect("unable to parse the server bind address and port");
+                        //!    let listener = TcpListener::bind(bind).await
+                        //!        .expect("failed to bind TCP listener");
+                        //!    ## let server = async { Ok::<_, ()>(()) };
+                        //!
+                        //!    // Run your service!
+                        //!    if let Err(err) = serve(listener, app.into_make_service()).await {
+                        //!        eprintln!("server error: {:?}", err);
+                        //!    }
+                        //! }
+                        """,
+                        "Tokio" to ServerCargoDependency.TokioDev.toType(),
+                    )
+
+                HttpVersion.Http0x ->
+                    rustTemplate(
+                        """
+                        //! ```rust,no_run
+                        //! ## use std::net::SocketAddr;
+                        //! use $crateName::{$serviceName, ${serviceName}Config};
+                        //!
+                        //! ##[#{Tokio}::main]
+                        //! pub async fn main() {
+                        //!    let config = ${serviceName}Config::builder().build()$unwrapConfigBuilder;
+                        //!    let app = $serviceName::builder(config)
+                        ${builderFieldNames.values.joinToString("\n") { "//!        .$it($it)" }}
+                        //!        .build()
+                        //!        .expect("failed to build an instance of $serviceName");
+                        //!
+                        //!    let bind: SocketAddr = "127.0.0.1:6969".parse()
+                        //!        .expect("unable to parse the server bind address and port");
+                        //!    let server = #{Hyper}::Server::bind(&bind).serve(app.into_make_service());
+                        //!    ## let server = async { Ok::<_, ()>(()) };
+                        //!
+                        //!    // Run your service!
+                        //!    if let Err(err) = server.await {
+                        //!        eprintln!("server error: {:?}", err);
+                        //!    }
+                        //! }
+                        """,
+                        "Hyper" to ServerCargoDependency.hyperDev(codegenContext.runtimeConfig).toType(),
+                        "Tokio" to ServerCargoDependency.TokioDev.toType(),
+                    )
+            }
+        }
 
     fun documentation(writer: RustWriter) {
         val builderFieldNames =
@@ -84,109 +222,9 @@ open class ServerRootGenerator(
             //! The [`crate::${InputModule.name}`], ${if (!hasErrors) "and " else ""}[`crate::${OutputModule.name}`], ${if (hasErrors) "and [`crate::${ErrorModule.name}`]" else "" }
             //! modules provide the types used in each operation.
             //!
-            ${if (codegenContext.isHttp1()) {
-                """
-                //! ###### Quick Start - Using `serve`
-                //!
-                //! The simplest way to run your service is using the [`server::serve`] function:
-                //!
-                //! ```rust,no_run
-                //! ## use std::net::SocketAddr;
-                //! ## async fn dummy() {
-                //! use $crateName::{$serviceName, ${serviceName}Config};
-                //! use #{Tokio}::net::TcpListener;
-                //!
-                //! ## let app = $serviceName::builder(
-                //! ##     ${serviceName}Config::builder()
-                //! ##         .build()$unwrapConfigBuilder
-                //! ## ).build_unchecked();
-                //! let listener = TcpListener::bind("127.0.0.1:6969").await.expect("failed to bind");
-                //! $crateName::server::serve(listener, app.into_make_service()).await.expect("server error");
-                //! ## }
-                //! ```
-                //!
-                //! For graceful shutdown:
-                //!
-                //! ```rust,no_run
-                //! ## use std::net::SocketAddr;
-                //! ## async fn dummy() {
-                //! use $crateName::{$serviceName, ${serviceName}Config};
-                //! use #{Tokio}::net::TcpListener;
-                //! use #{Tokio}::signal;
-                //!
-                //! ## let app = $serviceName::builder(
-                //! ##     ${serviceName}Config::builder()
-                //! ##         .build()$unwrapConfigBuilder
-                //! ## ).build_unchecked();
-                //! let listener = TcpListener::bind("127.0.0.1:6969").await.expect("failed to bind");
-                //! $crateName::server::serve(listener, app.into_make_service())
-                //!     .with_graceful_shutdown(async {
-                //!         signal::ctrl_c().await.expect("failed to listen for Ctrl+C");
-                //!     })
-                //!     .await
-                //!     .expect("server error");
-                //! ## }
-                //! ```
-                //!
-                //! ###### Advanced - Using Hyper Directly
-                //!
-                //! For more control over the server (custom executors, HTTP/2 settings, etc.),
-                //! you can use hyper-util directly:
-                """.trimIndent()
-            } else {
-                ""
-            }}
+            //! ###### Running on Hyper
             //!
-            ${if (!codegenContext.isHttp1()) "//! ###### Running on Hyper\n//!" else ""}
-            //! ```rust,no_run
-            //! ## use std::net::SocketAddr;
-            //! ## async fn dummy() {
-            //! use $crateName::{$serviceName, ${serviceName}Config};
-            //!
-            //! ## let app = $serviceName::builder(
-            //! ##     ${serviceName}Config::builder()
-            //! ##         .build()$unwrapConfigBuilder
-            //! ## ).build_unchecked();
-            ${if (codegenContext.isHttp1()) {
-                """
-                //! use #{HyperUtil}::rt::TokioIo;
-                //! use #{HyperUtil}::rt::TokioExecutor;
-                //! use #{Tokio}::net::TcpListener;
-                //! use #{Tower}::Service;
-                //!
-                //! let bind: SocketAddr = "127.0.0.1:6969".parse()
-                //!     .expect("unable to parse the server bind address and port");
-                //! let listener = TcpListener::bind(bind).await.expect("failed to bind");
-                //!
-                //! loop {
-                //!     let (stream, remote_addr) = listener.accept().await.expect("failed to accept connection");
-                //!     let tower_service = app.clone();
-                //!
-                //!     #{Tokio}::task::spawn(async move {
-                //!         let io = TokioIo::new(stream);
-                //!         let hyper_service = #{Hyper}::service::service_fn(move |request| {
-                //!             tower_service.clone().call(request)
-                //!         });
-                //!
-                //!         if let Err(err) = #{HyperUtil}::server::conn::auto::Builder::new(TokioExecutor::new())
-                //!             .serve_connection_with_upgrades(io, hyper_service)
-                //!             .await
-                //!         {
-                //!             eprintln!("Error serving connection: {:?}", err);
-                //!         }
-                //!     });
-                //! }
-                """.trimIndent()
-            } else {
-                """
-                //! let server = app.into_make_service();
-                //! let bind: SocketAddr = "127.0.0.1:6969".parse()
-                //!     .expect("unable to parse the server bind address and port");
-                //! #{Hyper}::Server::bind(&bind).serve(server).await.unwrap();
-                """.trimIndent()
-            }}
-            //! ## }
-            //! ```
+            #{HyperServeExample:W}
             //!
             //! ###### Running on Lambda
             //!
@@ -217,15 +255,15 @@ open class ServerRootGenerator(
             //! ```rust,no_run
             //! ## use $crateName::server::plugin::IdentityPlugin as LoggingPlugin;
             //! ## use $crateName::server::plugin::IdentityPlugin as MetricsPlugin;
-            ${if (codegenContext.isHttp1()) "//! use $crateName::server::body::BoxBody;" else "//! ## use #{Hyper}::Body;"}
+            //! ## use #{Body};
             //! use $crateName::server::plugin::HttpPlugins;
-            ${if (codegenContext.isHttp1()) "//! use $crateName::{$serviceName, ${serviceName}Config};" else "//! use $crateName::{$serviceName, ${serviceName}Config, $builderName};"}
+            //! use $crateName::{$serviceName, ${serviceName}Config, $builderName};
             //!
             //! let http_plugins = HttpPlugins::new()
             //!         .push(LoggingPlugin)
             //!         .push(MetricsPlugin);
-            //! let config = ${serviceName}Config::builder().http_plugin(http_plugins).build()$unwrapConfigBuilder;
-            ${if (codegenContext.isHttp1()) "//! let _app = $serviceName::builder::<BoxBody, _, _, _>(config).build_unchecked();" else "//! let builder: $builderName<Body, _, _, _> = $serviceName::builder(config);"}
+            //! let config = ${serviceName}Config::builder().build()$unwrapConfigBuilder;
+            //! let builder: $builderName<#{Body}, _, _, _> = $serviceName::builder(config);
             //! ```
             //!
             //! Check out [`crate::server::plugin`] to learn more about plugins.
@@ -289,62 +327,7 @@ open class ServerRootGenerator(
             //!
             //! ## Example
             //!
-            //! ```rust,no_run
-            //! ## use std::net::SocketAddr;
-            //! use $crateName::{$serviceName, ${serviceName}Config};
-            //!
-            //! ##[#{Tokio}::main]
-            //! pub async fn main() {
-            //!    let config = ${serviceName}Config::builder().build()$unwrapConfigBuilder;
-            //!    let app = $serviceName::builder(config)
-            ${builderFieldNames.values.joinToString("\n") { "//!        .$it($it)" }}
-            //!        .build()
-            //!        .expect("failed to build an instance of $serviceName");
-            //!
-            ${if (codegenContext.isHttp1()) {
-                """
-                //!    use #{HyperUtil}::rt::TokioIo;
-                //!    use #{HyperUtil}::rt::TokioExecutor;
-                //!    use #{Tokio}::net::TcpListener;
-                //!    use #{Tower}::Service;
-                //!
-                //!    let bind: SocketAddr = "127.0.0.1:6969".parse()
-                //!        .expect("unable to parse the server bind address and port");
-                //!    let listener = TcpListener::bind(bind).await.expect("failed to bind");
-                //!
-                //!    loop {
-                //!        let (stream, remote_addr) = listener.accept().await.expect("failed to accept connection");
-                //!        let tower_service = app.clone();
-                //!
-                //!        #{Tokio}::task::spawn(async move {
-                //!            let io = TokioIo::new(stream);
-                //!            let hyper_service = #{Hyper}::service::service_fn(move |request| {
-                //!                tower_service.clone().call(request)
-                //!            });
-                //!
-                //!            if let Err(err) = #{HyperUtil}::server::conn::auto::Builder::new(TokioExecutor::new())
-                //!                .serve_connection_with_upgrades(io, hyper_service)
-                //!                .await
-                //!            {
-                //!                eprintln!("Error serving connection: {:?}", err);
-                //!            }
-                //!        });
-                //!    }
-                """.trimIndent()
-            } else {
-                """
-                //!    let bind: SocketAddr = "127.0.0.1:6969".parse()
-                //!        .expect("unable to parse the server bind address and port");
-                //!    let server = #{Hyper}::Server::bind(&bind).serve(app.into_make_service());
-                //!    ## let server = async { Ok::<_, ()>(()) };
-                //!
-                //!    // Run your service!
-                //!    if let Err(err) = server.await {
-                //!        eprintln!("server error: {:?}", err);
-                //!    }
-                """.trimIndent()
-            }}
-            //! }
+            #{FullExample:W}
             //!
             #{HandlerImports:W}
             //!
@@ -352,21 +335,55 @@ open class ServerRootGenerator(
             //!
             //! ```
             //!
-            //! [`serve`]: https://docs.rs/hyper/0.14.16/hyper/server/struct.Builder.html##method.serve
+            #{ServeLink}
             //! [`tower::make::MakeService`]: https://docs.rs/tower/latest/tower/make/trait.MakeService.html
             //! [HTTP binding traits]: https://smithy.io/2.0/spec/http-bindings.html
             //! [operations]: https://smithy.io/2.0/spec/service-types.html##operation
-            //! [hyper server]: https://docs.rs/hyper/latest/hyper/server/index.html
             //! [Service]: https://docs.rs/tower-service/latest/tower_service/trait.Service.html
             """,
             "HandlerImports" to handlerImports(crateName, operations, commentToken = "//!"),
             "Handlers" to handlers,
             "ExampleHandler" to operations.take(1).map { operation -> DocHandlerGenerator(codegenContext, operation, builderFieldNames[operation]!!, "//!").docSignature() },
-            "Hyper" to codegenContext.httpDependencies().hyperDevModule(),
-            "HyperUtil" to RuntimeType("hyper_util", CargoDependency("hyper-util", CratesIo("0.1"), scope = DependencyScope.Dev, features = setOf("service"))),
+            "HyperServeExample" to hyperServeExample(crateName, serviceName, unwrapConfigBuilder),
+            "FullExample" to fullExample(crateName, serviceName, unwrapConfigBuilder, builderFieldNames),
+            "Hyper" to ServerCargoDependency.hyperDev(codegenContext.runtimeConfig).toType(),
             "Tokio" to ServerCargoDependency.TokioDev.toType(),
             "Tower" to ServerCargoDependency.Tower.toType(),
+            "Body" to
+                when (codegenContext.runtimeConfig.httpVersion) {
+                    HttpVersion.Http0x ->
+                        ServerCargoDependency.hyperDev(codegenContext.runtimeConfig).toType().resolve("Body")
+                    HttpVersion.Http1x ->
+                        ServerCargoDependency.hyperDev(codegenContext.runtimeConfig).toType().resolve("body::Incoming")
+                },
+            "ServeLink" to serveLink(codegenContext.runtimeConfig, crateName),
         )
+    }
+
+    private fun serveLink(
+        runtimeConfig: RuntimeConfig,
+        crateName: String,
+    ) = writable {
+        when (runtimeConfig.httpVersion) {
+            HttpVersion.Http0x -> {
+                rustTemplate(
+                    """
+                    //! [`serve`]: https://docs.rs/hyper/0.14.16/hyper/server/struct.Builder.html##method.serve
+                    //! [hyper server]: https://docs.rs/hyper/#{Hyper0Version}/hyper/server/index.html
+                    """,
+                    "Hyper0Version" to writable { rust(ServerCargoDependency.hyperDev(codegenContext.runtimeConfig).version()) },
+                )
+            }
+
+            HttpVersion.Http1x -> {
+                rustTemplate(
+                    """
+                        //! [`serve`]: $crateName::server::serve
+                        //! [hyper server]: https://docs.rs/hyper/latest/hyper/server/index.html
+                        """,
+                )
+            }
+        }
     }
 
     /**

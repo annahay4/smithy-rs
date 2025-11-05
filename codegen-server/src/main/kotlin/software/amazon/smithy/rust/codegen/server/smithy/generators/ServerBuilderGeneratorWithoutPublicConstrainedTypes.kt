@@ -89,11 +89,10 @@ class ServerBuilderGeneratorWithoutPublicConstrainedTypes(
     private val serverBuilderConstraintViolations =
         ServerBuilderConstraintViolations(codegenContext, shape, builderTakesInUnconstrainedTypes = false, validationExceptionConversionGenerator)
     private val lifetime = shape.lifetimeDeclaration(symbolProvider)
-    private val smithyTypes = codegenContext.httpDependencies().smithyTypesModule()
 
     private val codegenScope =
         arrayOf(
-            "RequestRejection" to protocol.requestRejection(codegenContext.httpDependencies().smithyHttpServer),
+            "RequestRejection" to protocol.requestRejection(codegenContext.runtimeConfig),
             "Structure" to structureSymbol,
             "From" to RuntimeType.From,
             "TryFrom" to RuntimeType.TryFrom,
@@ -195,7 +194,6 @@ class ServerBuilderGeneratorWithoutPublicConstrainedTypes(
                             runtimeConfig,
                             symbolProvider,
                             codegenContext.settings.codegenConfig.publicConstrainedTypes,
-                            smithyTypes,
                         )
                     } else {
                         // 1b. If the member is `@required` and has no `@default` value, the user must set a value;
