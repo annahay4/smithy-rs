@@ -14,7 +14,7 @@ use crate::{attributes::Attributes, instruments::ProvideInstrument};
 use std::{borrow::Cow, fmt::Debug, sync::Arc};
 
 /// Provides named instances of [Meter].
-pub trait ProvideMeter: Send + Sync + Debug {
+pub trait ProvideMeter: Send + Sync + Debug + std::any::Any {
     /// Get or create a named [Meter].
     fn get_meter(&self, scope: &'static str, attributes: Option<&Attributes>) -> Meter;
 }

@@ -387,10 +387,50 @@ internal class EndpointResolverGenerator(
         val url = generator.generate(endpoint.url)
         val headers = endpoint.headers.mapValues { entry -> entry.value.map { generator.generate(it) } }
         val properties = endpoint.properties.mapValues { entry -> generator.generate(entry.value) }
+
+        // Check if the endpoint URL comes from the Endpoint parameter (custom endpoint)
+        val usesEndpointParam =
+            endpoint.url.accept(
+                object : software.amazon.smithy.rulesengine.language.syntax.expressions.ExpressionVisitor<Boolean> {
+                    override fun visitLiteral(
+                        literal: software.amazon.smithy.rulesengine.language.syntax.expressions.literal.Literal,
+                    ): Boolean = false
+
+                    override fun visitRef(reference: Reference): Boolean = reference.name.toString() == "Endpoint"
+
+                    override fun visitGetAttr(
+                        getAttr: software.amazon.smithy.rulesengine.language.syntax.expressions.functions.GetAttr,
+                    ): Boolean = false
+
+                    override fun visitIsSet(fn: Expression): Boolean = false
+
+                    override fun visitNot(not: Expression): Boolean = false
+
+                    override fun visitBoolEquals(
+                        left: Expression,
+                        right: Expression,
+                    ): Boolean = false
+
+                    override fun visitStringEquals(
+                        left: Expression,
+                        right: Expression,
+                    ): Boolean = false
+
+                    override fun visitLibraryFunction(
+                        fn: software.amazon.smithy.rulesengine.language.syntax.expressions.functions.FunctionDefinition,
+                        args: MutableList<Expression>,
+                    ): Boolean = false
+                },
+            )
+
         return writable {
             rustTemplate("#{SmithyEndpoint}::builder().url(#{url:W})", *codegenScope, "url" to url)
             headers.forEach { (name, values) -> values.forEach { rust(".header(${name.dq()}, #W)", it) } }
             properties.forEach { (name, value) -> rust(".property(${name.toString().dq()}, #W)", value) }
+            // Mark endpoint as custom if it uses the Endpoint parameter
+            if (usesEndpointParam) {
+                rust(".property(\"is_custom_endpoint\", true)")
+            }
             rust(".build()")
         }
     }
