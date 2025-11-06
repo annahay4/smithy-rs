@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-observability"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aws-smithy-runtime-api",
  "serial_test",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime"
-version = "1.9.4"
+version = "1.9.5"
 dependencies = [
  "approx",
  "aws-smithy-async",
