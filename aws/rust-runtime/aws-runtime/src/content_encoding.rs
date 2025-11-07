@@ -84,16 +84,11 @@ impl DeferredSigner {
         }
     }
 
-    fn ensure_signer(&mut self) {
-        let mut signer = self.signer.lock().unwrap();
-        if signer.is_none() {
-            let mut rx = self.rx.lock().unwrap();
-            if let Some(receiver) = rx.take() {
-                if let Ok(new_signer) = receiver.try_recv() {
-                    *signer = Some(new_signer);
-                }
-            }
-        }
+    fn acquire(&self) -> Box<dyn SignChunk + Send + Sync> {
+        let mut rx = self.rx.lock().unwrap();
+        rx.take()
+            .and_then(|receiver| receiver.try_recv().ok())
+            .expect("signer not available")
     }
 }
 
@@ -103,23 +98,15 @@ impl Storable for DeferredSignerSender {
 
 impl SignChunk for DeferredSigner {
     fn chunk_signature(&mut self, chunk: &Bytes) -> Result<String, SigningError> {
-        self.ensure_signer();
-        self.signer
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .chunk_signature(chunk)
+        let mut signer = self.signer.lock().unwrap();
+        let signer = signer.get_or_insert_with(|| self.acquire());
+        signer.chunk_signature(chunk)
     }
 
     fn trailer_signature(&mut self, trailing_headers: &Headers) -> Result<String, SigningError> {
-        self.ensure_signer();
-        self.signer
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .trailer_signature(trailing_headers)
+        let mut signer = self.signer.lock().unwrap();
+        let signer = signer.get_or_insert_with(|| self.acquire());
+        signer.trailer_signature(trailing_headers)
     }
 }
 
