@@ -313,7 +313,7 @@ fn check_rate_limiter_for_delay(
     None
 }
 
-pub(super) fn calculate_exponential_backoff(
+pub(crate) fn calculate_exponential_backoff(
     base: f64,
     initial_backoff: f64,
     retry_attempts: u32,
