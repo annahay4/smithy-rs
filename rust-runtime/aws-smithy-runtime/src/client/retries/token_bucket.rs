@@ -6,13 +6,15 @@
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
 use aws_smithy_types::retry::ErrorKind;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::trace;
 
 const DEFAULT_CAPACITY: usize = 500;
-const RETRY_COST: u32 = 5;
-const RETRY_TIMEOUT_COST: u32 = RETRY_COST * 2;
+const DEFAULT_RETRY_COST: u32 = 5;
+const DEFAULT_RETRY_TIMEOUT_COST: u32 = DEFAULT_RETRY_COST * 2;
 const PERMIT_REGENERATION_AMOUNT: usize = 1;
+const DEFAULT_SUCCESS_REWARD: f64 = 0.0;
 
 /// Token bucket used for standard and adaptive retry.
 #[derive(Clone, Debug)]
@@ -21,6 +23,8 @@ pub struct TokenBucket {
     max_permits: usize,
     timeout_retry_cost: u32,
     retry_cost: u32,
+    success_reward: f64,
+    fractional_tokens: Arc<Mutex<f64>>,
 }
 
 impl Storable for TokenBucket {
@@ -32,8 +36,10 @@ impl Default for TokenBucket {
         Self {
             semaphore: Arc::new(Semaphore::new(DEFAULT_CAPACITY)),
             max_permits: DEFAULT_CAPACITY,
-            timeout_retry_cost: RETRY_TIMEOUT_COST,
-            retry_cost: RETRY_COST,
+            timeout_retry_cost: DEFAULT_RETRY_TIMEOUT_COST,
+            retry_cost: DEFAULT_RETRY_COST,
+            success_reward: DEFAULT_SUCCESS_REWARD,
+            fractional_tokens: Arc::new(Mutex::new(0.0)),
         }
     }
 }
@@ -55,6 +61,8 @@ impl TokenBucket {
             max_permits: Semaphore::MAX_PERMITS,
             timeout_retry_cost: 0,
             retry_cost: 0,
+            success_reward: 0.0,
+            fractional_tokens: Arc::new(Mutex::new(0.0)),
         }
     }
 
@@ -77,10 +85,25 @@ impl TokenBucket {
     }
 
     pub(crate) fn regenerate_a_token(&self) {
-        if self.semaphore.available_permits() < self.max_permits {
-            trace!("adding {PERMIT_REGENERATION_AMOUNT} back into the bucket");
-            self.semaphore.add_permits(PERMIT_REGENERATION_AMOUNT)
+        self.add_tokens(PERMIT_REGENERATION_AMOUNT);
+    }
+
+    pub(crate) fn reward_success(&self) {
+        if self.success_reward > 0.0 {
+            *self.fractional_tokens.lock().unwrap() += self.success_reward;
         }
+
+        let full_tokens_accumulated = self.fractional_tokens.lock().unwrap().floor();
+        if full_tokens_accumulated >= 1.0 {
+            *self.fractional_tokens.lock().unwrap() -= full_tokens_accumulated;
+            self.add_tokens(full_tokens_accumulated as usize);
+        }
+    } 
+
+    fn add_tokens(&self, amount: usize) {
+        let tokens_to_add = amount.min(self.max_permits - self.semaphore.available_permits());
+        trace!("adding {tokens_to_add} back into the bucket");
+        self.semaphore.add_permits(tokens_to_add);
     }
 
     #[cfg(all(test, any(feature = "test-util", feature = "legacy-test-util")))]
@@ -95,6 +118,7 @@ pub struct TokenBucketBuilder {
     capacity: Option<usize>,
     retry_cost: Option<u32>,
     timeout_retry_cost: Option<u32>,
+    success_reward: Option<f64>,
 }
 
 impl TokenBucketBuilder {
@@ -121,13 +145,21 @@ impl TokenBucketBuilder {
         self
     }
 
+    /// Sets the reward for any successful request for the builder.
+    pub fn success_reward(mut self, reward: f64) -> Self {
+        self.success_reward = Some(reward);
+        self
+    }
+
     /// Builds a `TokenBucket`.
     pub fn build(self) -> TokenBucket {
         TokenBucket {
             semaphore: Arc::new(Semaphore::new(self.capacity.unwrap_or(DEFAULT_CAPACITY))),
             max_permits: self.capacity.unwrap_or(DEFAULT_CAPACITY),
-            retry_cost: self.retry_cost.unwrap_or(RETRY_COST),
-            timeout_retry_cost: self.timeout_retry_cost.unwrap_or(RETRY_TIMEOUT_COST),
+            retry_cost: self.retry_cost.unwrap_or(DEFAULT_RETRY_COST),
+            timeout_retry_cost: self.timeout_retry_cost.unwrap_or(DEFAULT_RETRY_TIMEOUT_COST),
+            success_reward: self.success_reward.unwrap_or(DEFAULT_SUCCESS_REWARD),
+            fractional_tokens: Arc::new(Mutex::new(0.0)),
         }
     }
 }
@@ -184,4 +216,59 @@ mod tests {
         // Verify next acquisition fails
         assert!(bucket.acquire(&ErrorKind::ThrottlingError).is_none());
     }
+
+    #[test]
+    fn test_fractional_tokens_accumulate_and_convert() {
+        let bucket = TokenBucket::builder()
+            .capacity(10)
+            .success_reward(0.4)
+            .build();
+        
+        // acquire 10 tokens to bring capacity below max so we can test accumulation
+        let _hold_permit = bucket.acquire(&ErrorKind::TransientError);
+        assert_eq!(bucket.semaphore.available_permits(), 0);
+
+        // First success: 0.4 fractional tokens
+        bucket.reward_success();
+        assert_eq!(bucket.semaphore.available_permits(), 0);
+        
+        // Second success: 0.8 fractional tokens
+        bucket.reward_success();
+        assert_eq!(bucket.semaphore.available_permits(), 0);
+        
+        // Third success: 1.2 fractional tokens -> 1 full token added
+        bucket.reward_success();
+        assert_eq!(bucket.semaphore.available_permits(), 1);
+    }
+
+    #[test]
+    fn test_fractional_tokens_respect_max_capacity() {
+        let bucket = TokenBucket::builder()
+            .capacity(10)
+            .success_reward(2.0)
+            .build();
+        
+        for _ in 0..20 {
+            bucket.reward_success();
+        }
+        
+        assert!(bucket.semaphore.available_permits() == 10);
+    }
+
+    #[cfg(any(feature = "test-util", feature = "legacy-test-util"))]
+    #[test]
+    fn test_builder_with_custom_values() {
+        let bucket = TokenBucket::builder()
+            .capacity(100)
+            .retry_cost(10)
+            .timeout_retry_cost(20)
+            .success_reward(0.5)
+            .build();
+        
+        assert_eq!(bucket.max_permits, 100);
+        assert_eq!(bucket.retry_cost, 10);
+        assert_eq!(bucket.timeout_retry_cost, 20);
+        assert_eq!(bucket.success_reward, 0.5);
+    }
+
 }
