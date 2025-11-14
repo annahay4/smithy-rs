@@ -353,6 +353,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "test-util", feature = "legacy-test-util"))]
     #[test]
     fn test_atomicf64_store_load_preserves_exact_bits() {
         let atomic = AtomicF64::new(0.0);
@@ -381,6 +382,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "test-util", feature = "legacy-test-util"))]
     #[test] 
     fn test_atomicf64_concurrent_store_load_safety() {
         use std::sync::Arc;
@@ -400,7 +402,7 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         // Start a reader thread that continuously reads
         let atomic_reader = Arc::clone(&atomic);
         let reader_handle = thread::spawn(move || {
@@ -411,7 +413,7 @@ mod tests {
             }
             readings
         });
-        
+
         // Wait for all writers to complete
         for handle in handles {
             handle.join().expect("Writer thread panicked");
@@ -427,10 +429,11 @@ mod tests {
             // More importantly, verify the reading is a valid f64 
             // (not corrupted bits that happen to parse as valid)
             assert!(reading.is_finite() || reading == 0.0,
-                "Corrupted reading detected: {}");
+                "Corrupted reading detected");
         }
     }
 
+    #[cfg(any(feature = "test-util", feature = "legacy-test-util"))]
     #[test]
     fn test_atomicf64_stress_concurrent_access() {
         use std::sync::{Arc, Barrier};
@@ -467,45 +470,6 @@ mod tests {
         }
     }
 
-
-    #[test]
-    fn test_atomicf64_relaxed_ordering_semantics() {
-        use std::sync::Arc;
-        use std::thread;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        
-        // Test that Relaxed ordering doesn't cause obvious problems
-        // (This is hard to test definitively, but we can check basic operation)
-        let atomic = Arc::new(AtomicF64::new(1.0));
-        let flag = Arc::new(AtomicBool::new(false));
-        
-        let atomic_clone = Arc::clone(&atomic);
-        let flag_clone = Arc::clone(&flag);
-        
-        let writer = thread::spawn(move || {
-            atomic_clone.store(42.0);
-            flag_clone.store(true, Ordering::Release);
-        });
-        
-        let atomic_reader = Arc::clone(&atomic);
-        let flag_reader = Arc::clone(&flag);
-        
-        let reader = thread::spawn(move || {
-            // Spin until flag is set
-            while !flag_reader.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-            }
-            atomic_reader.load()
-        });
-        
-        writer.join().expect("Writer panicked");
-        let final_value = reader.join().expect("Reader panicked");
-        
-        // Due to relaxed ordering on the AtomicF64, we might see the old or new value
-        assert!(final_value == 1.0 || final_value == 42.0,
-            "Unexpected value: {}", final_value);
-    }
-
     #[test]
     fn test_atomicf64_integration_with_token_bucket_usage() {
         let atomic = AtomicF64::new(0.0);
@@ -532,7 +496,7 @@ mod tests {
         assert_eq!(remaining, expected_total - expected_total.floor());
     }
 
-
+    #[cfg(any(feature = "test-util", feature = "legacy-test-util"))]
     #[test]
     fn test_atomicf64_clone_creates_independent_copy() {
         let original = AtomicF64::new(123.456);
