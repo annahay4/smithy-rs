@@ -9,7 +9,6 @@ use std::fmt;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::sync::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::trace;
 
@@ -130,7 +129,7 @@ impl TokenBucket {
     pub(crate) fn reward_success(&self) {
         // Verify that fractional tokens have not become corrupted
         if !self.fractional_tokens.load().is_finite() {
-            tracing::error!("Fractional tokens corrupted to: {}", current);
+            tracing::error!("Fractional tokens corrupted to: {}", self.fractional_tokens.load());
             // If corrupted, reset to the number of permits the bucket was created with
             self.fractional_tokens.store(self.max_permits as f64);
             return;
